@@ -5,6 +5,9 @@ Fluxo: inventário -> identidade -> COLLECTION_HANDLERS -> validação -> public
 Cada handler tem uma função collect_* e retorna exatamente um registro de entrada.
 CollectionContext compartilha consultas dentro de um equipamento, sem novo login.
 O JSON v2 publicado contém um objeto por unidade, com device_info e 25 events.
+Falhas de comunicação são isoladas por unidade, com sondagem REST inicial e
+limites de tempo supervisionados em processos Linux separados. Eventos sem
+medição ficam UNKNOWN; o arquivo final é substituído somente após validação.
 
 Autenticação e sessão pertencem ao storage_api_manager do usuário. Linux/RHEL
 8 ou 9, Python 3.6+. Consulte README_Coletor_Unity.md para operação e
@@ -12,13 +15,16 @@ MANUTENCAO_Coletor_Unity.md para alterar handlers e diagnosticar falhas.
 """
 
 import argparse
+import errno
 import fcntl
 import inspect
 import json
 import logging
 import math
+import multiprocessing
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -92,10 +98,21 @@ SECURITY = {
     "Ransomware Pattern": "is_ransomware_suspected",
 }
 COLLECTION_STATUSES = frozenset(("collected", "partial", "unavailable", "unsupported", "not_applicable"))
+COMMUNICATION_TIMEOUT = 30
+REQUEST_TIMEOUT = 30
+DEVICE_TIMEOUT = 300
 
 
 class CollectionError(RuntimeError):
     """Falha com mensagem controlada, que pode aparecer no log sem credenciais."""
+
+
+class HandlerError(CollectionError):
+    """Erro de código/contrato de um handler; não deve virar falha de comunicação."""
+
+
+class CommunicationError(CollectionError):
+    """Comunicação interrompida; novas chamadas da mesma unidade são bloqueadas."""
 
 
 class RESTError(CollectionError):
@@ -192,6 +209,20 @@ def supports_json_body(storage):
                                        for parameter in parameters.values())
 
 
+def is_transport_error(error):
+    """Reconhece falhas de rede/TLS pelas classes, sem importar o motor ou requests.
+
+    Não usa texto externo para classificar ou registrar a falha. Erros de
+    programação e HTTP de um recurso opcional não são considerados queda de link.
+    """
+    names = {kind.__name__ for kind in type(error).__mro__}
+    return bool(names & {"ConnectionError", "TimeoutError", "Timeout", "SSLError",
+                         "ProxyError", "ChunkedEncodingError", "ProtocolError",
+                         "RemoteDisconnected", "gaierror"}) or getattr(error, "errno", None) in (
+                             errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED,
+                             errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE)
+
+
 def redact_diagnostic(value):
     """Oculta campos de autenticação e segredos nomeados nos corpos de debug.
 
@@ -218,8 +249,8 @@ def redact_diagnostic(value):
 class UnityAPI:
     """Adapta make_request e valida REST/paginação usando a sessão existente."""
 
-    def __init__(self, storage, address, max_pages=500, verbosity=0):
-        """Recebe sessão, limite de páginas e nível 0/1/2 do diagnóstico."""
+    def __init__(self, storage, address, max_pages=500, verbosity=0, progress=None):
+        """Recebe sessão, paginação, diagnóstico e callback da supervisão Linux."""
         self.storage = storage
         base = address if "://" in address else "https://" + address
         self.origin = urlsplit(base)
@@ -227,6 +258,20 @@ class UnityAPI:
         self.verbosity = verbosity
         self.device_name = "não informado"
         self.handler = "identificação"
+        self.progress = progress
+        self.communication_error = None
+
+    def report(self, kind, **values):
+        """Envia progresso ao supervisor; uso direto do adaptador não exige callback."""
+        if self.progress is not None:
+            self.progress(dict(values, kind=kind))
+
+    def interrupt_communication(self, reason, path):
+        """Abre o bloqueio local de comunicação, sem logout, reparo ou novo login."""
+        self.communication_error = {"reason": reason, "endpoint": self.endpoint(path),
+                                    "handler": self.handler}
+        LOG.warning("etapa=comunicacao equipamento=%s status=interrompida handler=%r endpoint=%s motivo=%s",
+                    self.device_name, self.handler, self.endpoint(path), reason)
 
     def endpoint(self, path):
         """Mostra URL HTTPS e query legível, sem userinfo nem segredos nomeados."""
@@ -251,6 +296,31 @@ class UnityAPI:
 
     def request(self, method, path, body=None):
         """Executa REST; -v mostra query completa, -vv também os corpos sem segredos."""
+        if self.communication_error is not None:
+            raise CommunicationError(self.communication_error["reason"])
+        self.report("request_start", started=time.monotonic(), method=method,
+                    endpoint=self.endpoint(path), handler=self.handler)
+        try:
+            return self._request(method, path, body)
+        except RESTError as error:
+            if error.status in (401, 403, 429, 502, 503, 504):
+                self.interrupt_communication(error_text(error), path)
+            raise
+        except Exception as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            if isinstance(status, int) and not isinstance(status, bool) and not 200 <= status < 300:
+                controlled = RESTError(status, urlsplit(path).path)
+                if status in (401, 403, 429, 502, 503, 504):
+                    self.interrupt_communication(error_text(controlled), path)
+                raise controlled from error
+            if is_transport_error(error) or isinstance(error, CommunicationError):
+                self.interrupt_communication(error_text(error), path)
+            raise
+        finally:
+            self.report("request_end")
+
+    def _request(self, method, path, body):
+        """Lê uma resposta pela interface pública do motor, sem modificar a sessão."""
         LOG.debug("etapa=consulta equipamento=%s handler=%r metodo=%s endpoint=%s",
                   self.device_name, self.handler, method, self.endpoint(path))
         if body is not None and self.verbosity >= 2:
@@ -264,7 +334,7 @@ class UnityAPI:
                 raise CollectionError("make_request não aceita json=; usando somente consultas GET.")
             response = self.storage.make_request(method, path, json=body)
         if response is None:
-            raise CollectionError("O motor retornou uma resposta vazia.")
+            raise CommunicationError("O motor retornou uma resposta vazia.")
         status = getattr(response, "status_code", 200)
         # Lê o JSON uma vez. Em -vv erros HTTP também mostram o corpo recebido.
         payload, is_json = None, False
@@ -696,7 +766,7 @@ class CollectionContext:
                    manufacturer_category="Monitoring", collection_status=status,
                    collection_reason=reason, custom_description=reason,
                    source_details={"system_id": self.system["id"], "system_name": self.system.get("name"),
-                                   "model": str(self.system["model"]), "observations": details or {}})
+                                   "model": self.system.get("model"), "observations": details or {}})
         row.update(values)
         query_issues = {}
         for resource in sorted(self.handler_resources):
@@ -764,8 +834,8 @@ def build_common_fields(context):
     version = next((item.get("fullVersion") or item.get("version") for item in versions
                     if item.get("fullVersion") or item.get("version")), None)
     row = dict.fromkeys(INPUT_FIELDS)
-    row.update(family="unity", type=str(context.system["model"]), name=context.device["name"],
-               serial_number=str(context.system["serialNumber"]), service_tag=context.device.get("service_tag"),
+    row.update(family="unity", type=context.system.get("model"), name=context.device["name"],
+               serial_number=context.system.get("serialNumber"), service_tag=context.device.get("service_tag"),
                software_version=version, datetime=iso(context.started),
                manufacturer_division="Dell Unity", manufacturer_severity="Info", priority="P4")
     return row
@@ -1181,6 +1251,8 @@ def collect_certificate_expiring(context):
     Falha/timeout do OpenSSL gera unavailable; não usa outro certificado da API
     como substituto silencioso do certificado HTTPS solicitado.
     """
+    if context.api.communication_error is not None:
+        return context.event("Certificate Expiring", "unavailable", context.api.communication_error["reason"])
     try:
         details = probe_https_certificate(
             context.device["ip"], context.started,
@@ -1226,7 +1298,7 @@ def collect_ransomware_pattern(context):
     return row
 
 
-# Registro único: um nome de evento, uma função, uma chamada por equipamento.
+# Registro único: um nome de evento e uma função por regra de coleta.
 # A ordem acompanha ACTIVE_HANDLERS do construtor. Fan Failure precede High Temp.
 COLLECTION_HANDLERS = OrderedDict([
     ("Cluster Down", collect_cluster_down),
@@ -1261,14 +1333,30 @@ HANDLERS = tuple(COLLECTION_HANDLERS)
 def identify_system(api, device):
     """Consulta system e valida identidade obrigatória; None indica modelo fora do escopo."""
     systems = api.collection("system", "id,name,model,serialNumber,health")
-    if len(systems) != 1 or not systems[0].get("model") or not systems[0].get("serialNumber"):
-        raise CollectionError("Identidade do equipamento incompleta; publicação cancelada.")
+    if (len(systems) != 1 or systems[0].get("id") is None
+            or any(not isinstance(systems[0].get(field), str) or not systems[0][field].strip()
+                   for field in ("model", "serialNumber"))):
+        raise CollectionError("Identidade do equipamento incompleta na sondagem REST.")
     system = systems[0]
     if not re.search(r"(?<!\d)(380F|480F)(?!\w)", str(system["model"]), re.IGNORECASE):
         LOG.info("etapa=identidade equipamento=%s modelo=%s status=fora_do_escopo",
                  device["name"], system["model"])
         return None
     LOG.info("etapa=identidade equipamento=%s modelo=%s status=identificado", device["name"], system["model"])
+    return system
+
+
+def probe_communication(api, device):
+    """Testa a API autenticada antes dos handlers e reutiliza a identidade recebida.
+
+    Um ping não verificaria sessão/permissão REST. A mesma consulta system
+    confirma modelo e serial; não há login adicional ou consulta duplicada.
+    """
+    LOG.info("etapa=sondagem equipamento=%s status=iniciado", device["name"])
+    system = identify_system(api, device)
+    api.report("identity", system=system)
+    LOG.info("etapa=sondagem equipamento=%s status=%s", device["name"],
+             "comunicando" if system is not None else "fora_do_escopo")
     return system
 
 
@@ -1283,6 +1371,7 @@ def execute_handlers(context):
         context.api.handler = event
         context.handler_resources.clear()
         started = time.monotonic()
+        context.api.report("handler", handler=event, function=handler.__name__)
         LOG.debug("etapa=handler equipamento=%s handler=%r funcao=%s status=iniciado",
                   context.device["name"], event, handler.__name__)
         try:
@@ -1290,9 +1379,10 @@ def execute_handlers(context):
             if not isinstance(row, dict) or row.get("event_name") != event:
                 raise CollectionError("Handler não retornou o registro do evento esperado.")
         except Exception as error:
-            raise CollectionError("etapa=handler equipamento={} handler={!r} funcao={} erro={} local={}".format(
+            raise HandlerError("etapa=handler equipamento={} handler={!r} funcao={} erro={} local={}".format(
                 context.device["name"], event, handler.__name__, error_text(error), error_location(error))) from error
         context.results[event] = row
+        context.api.report("row", row=row)
         LOG.info("etapa=handler equipamento=%s handler=%r funcao=%s qualidade=%s duracao_ms=%.1f",
                  context.device["name"], event, handler.__name__, row.get("collection_status"),
                  (time.monotonic() - started) * 1000)
@@ -1302,22 +1392,28 @@ def execute_handlers(context):
     return list(context.results.values())
 
 
-def collect_device(device, storage, config=None, signals=None, now=None, sleep=time.sleep, verbosity=0):
+def collect_device(device, storage, config=None, signals=None, now=None, sleep=time.sleep, verbosity=0,
+                   progress=None):
     """Coleta uma Unity elegível usando uma única sessão e todos os handlers.
 
     Retorna um registro por COLLECTION_HANDLERS, na ordem do construtor; retorna
     [] para outro modelo Unity. Falha da identidade essencial levanta exceção.
     now/sleep permitem reproduzir o ciclo em testes sem conexões/esperas reais.
     verbosity=1 registra endpoints; 2 registra também corpos de respostas.
+    progress transmite identidade/eventos ao supervisor. O uso direto desta
+    função não impõe limites; a operação usa collect_bounded_device.
     """
-    api = UnityAPI(storage, device["ip"], verbosity=verbosity)
+    api = UnityAPI(storage, device["ip"], verbosity=verbosity, progress=progress)
     api.device_name = device["name"]
     started = now or utc_now()
-    system = identify_system(api, device)
+    system = probe_communication(api, device)
     if system is None:
         return []
     context = CollectionContext(device, api, system, config or {}, signals or {}, started, now is not None, sleep)
-    return execute_handlers(context)
+    rows = execute_handlers(context)
+    if api.communication_error is not None:
+        mark_interrupted_rows(rows, api.communication_error["reason"])
+    return rows
 
 
 def load_object(path):
@@ -1345,6 +1441,17 @@ def validate_config(config):
     if (not isinstance(certificate_timeout, int) or isinstance(certificate_timeout, bool)
             or not 1 <= certificate_timeout <= 60):
         raise CollectionError("certificate_timeout_seconds deve estar entre 1 e 60.")
+    limits = (("communication_timeout_seconds", COMMUNICATION_TIMEOUT, 600),
+              ("request_timeout_seconds", REQUEST_TIMEOUT, 600),
+              ("device_timeout_seconds", DEVICE_TIMEOUT, 3600))
+    for key, default, maximum in limits:
+        value = config.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
+            raise CollectionError("{} deve estar entre 1 e {}.".format(key, maximum))
+    if config.get("device_timeout_seconds", DEVICE_TIMEOUT) < max(
+            config.get("communication_timeout_seconds", COMMUNICATION_TIMEOUT),
+            config.get("request_timeout_seconds", REQUEST_TIMEOUT)):
+        raise CollectionError("device_timeout_seconds deve ser maior ou igual aos limites de comunicação/requisição.")
     for key in ("metrics_max_age_seconds", "signal_max_age_seconds"):
         value = config.get(key, 300)
         if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 3600:
@@ -1421,9 +1528,10 @@ def validate_event_rows(rows):
         if key in identities and identities[key] != identity:
             raise CollectionError("Um equipamento tem identidade divergente entre handlers.")
         identities[key] = identity
-        if serial in serials and serials[serial] != key:
-            raise CollectionError("Um mesmo serial foi associado a nomes lógicos diferentes.")
-        serials[serial] = key
+        if serial is not None:
+            if serial in serials and serials[serial] != key:
+                raise CollectionError("Um mesmo serial foi associado a nomes lógicos diferentes.")
+            serials[serial] = key
         groups.setdefault(key, []).append(row["event_name"])
         for kind in ("disks", "fans", "psus", "controllers"):
             total, failed = row.get("total_" + kind), row.get("failed_" + kind)
@@ -1596,25 +1704,311 @@ def load_inventory(manager=None, host=None):
         return manager, credentials, devices
 
 
+class UnavailableContext(CollectionContext):
+    """Produz registros indisponíveis sem I/O quando uma unidade não pode responder.
+
+    A identidade já confirmada neste ciclo pode ser conservada. Modelo/serial
+    desconhecidos ficam None; dados de saúde de ciclos anteriores não são usados.
+    """
+
+    def __init__(self, device, system, config, started, reason):
+        """Monta um contexto bloqueado, sem sessão, sinais externos ou sondagem TLS."""
+        self.reason = reason
+        api = UnityAPI(None, device["ip"])
+        api.device_name = device["name"]
+        api.communication_error = {"reason": reason}
+        system = system or {"id": None, "name": None, "model": None, "serialNumber": None}
+        super().__init__(device, api, system, config, {}, started, True, time.sleep)
+
+    def resource(self, resource):
+        """Registra indisponibilidade sem consultar o equipamento ou reutilizar saúde."""
+        if resource != "system" and resource not in RESOURCES:
+            raise KeyError(resource)
+        self.handler_resources.add(resource)
+        self.resource_errors[resource] = self.reason
+        return None
+
+    def event(self, event, status="unavailable", reason="", details=None, **values):
+        """Descarta defaults sem evidência e informa indisponibilidade em todos os eventos."""
+        row = super().event(event, "unavailable", self.reason)
+        row["source_details"]["communication"] = {"status": "interrupted", "reason": self.reason}
+        return row
+
+
+def mark_interrupted_rows(rows, reason):
+    """Conserva medições/falhas reais e impede afirmar OK após interrupção da coleta."""
+    for row in rows:
+        status = row["collection_status"]
+        row["collection_status"] = "partial" if status in ("collected", "partial") else "unavailable"
+        if reason not in row["collection_reason"]:
+            row["collection_reason"] += " Coleta interrompida: " + reason
+        row["custom_description"] = row["collection_reason"]
+        row["source_details"]["communication"] = {"status": "interrupted", "reason": reason}
+
+
+def unavailable_device_rows(device, system, completed, config, now, reason):
+    """Completa os 25 eventos e mantém somente medições concluídas neste ciclo.
+
+    Após timeout abrupto, não reinicia a função que ficou bloqueada. Completa
+    seus registros com UNKNOWN; o construtor ainda chama todos ACTIVE_HANDLERS.
+    """
+    context = UnavailableContext(device, system, config, now or utc_now(), reason)
+    if completed:
+        # Horário e identidade devem permanecer uniformes entre os 25 registros.
+        first = next(iter(completed.values()))
+        context.common.update({field: first.get(field) for field in DEVICE_FIELDS})
+    rows = [completed[event] if event in completed else context.event(event) for event in HANDLERS]
+    mark_interrupted_rows(rows, reason)
+    return rows
+
+
+class DeviceProgress:
+    """Estado de supervisão por unidade; limita sessão, requisição e tempo total."""
+
+    def __init__(self, config):
+        """Inicia limites no relógio monotônico antes de criar a sessão no filho."""
+        self.config = config
+        self.started = time.monotonic()
+        self.device_deadline = self.started + config.get("device_timeout_seconds", DEVICE_TIMEOUT)
+        self.communication_deadline = self.started + config.get("communication_timeout_seconds", COMMUNICATION_TIMEOUT)
+        self.request_deadline = None
+        self.system = None
+        self.completed = OrderedDict()
+        self.stage = "sessao"
+        self.handler = None
+        self.endpoint = None
+
+    def update(self, message):
+        """Guarda identidade/eventos e a etapa atual; nunca recebe credenciais no pipe."""
+        kind = message["kind"]
+        if kind == "ready":
+            self.stage = "sessao"
+        elif kind == "identity":
+            self.system = message["system"]
+            self.communication_deadline = None
+            self.stage = "coleta"
+        elif kind == "request_start":
+            self.request_deadline = message["started"] + self.config.get("request_timeout_seconds", REQUEST_TIMEOUT)
+            self.stage = "sondagem" if self.communication_deadline is not None else "consulta"
+            self.endpoint, self.handler = message["endpoint"], message["handler"]
+        elif kind == "request_end":
+            self.request_deadline = None
+            self.stage = "sondagem" if self.communication_deadline is not None else "coleta"
+        elif kind == "handler":
+            self.handler = message["handler"]
+            self.stage = "handler"
+        elif kind == "row":
+            row = message["row"]
+            self.completed[row["event_name"]] = row
+
+    def deadline(self):
+        """Retorna o primeiro limite que pode vencer e sua categoria operacional."""
+        limits = [(self.device_deadline, "device_timeout_seconds")]
+        if self.communication_deadline is not None:
+            limits.append((self.communication_deadline, "communication_timeout_seconds"))
+        if self.request_deadline is not None:
+            limits.append((self.request_deadline, "request_timeout_seconds"))
+        return min(limits)
+
+    def failure_reason(self, detail):
+        """Acrescenta etapa, evento e endpoint controlado à causa da interrupção."""
+        parts = [detail, "etapa=" + self.stage]
+        if self.handler is not None:
+            parts.append("handler={!r}".format(self.handler))
+        if self.endpoint is not None:
+            parts.append("endpoint=" + self.endpoint)
+        return "; ".join(parts)
+
+
+def collect_unit(manager, credentials, device, config, signals, now, sleep, verbosity, progress=None,
+                 catalog_only=False):
+    """Abre uma sessão, faz a sondagem e isola falhas operacionais da unidade.
+
+    Sem modificar storage_api_manager, cria UnityXT uma vez. Erros de código
+    de handlers continuam globais; falhas de sessão/sondagem geram 25 UNKNOWN.
+    Esta função não impõe tempo: a CLI usa collect_bounded_device para supervisão.
+    """
+    state = DeviceProgress(config)
+    def report(message):
+        """Conserva progresso local e o envia ao supervisor, quando presente."""
+        state.update(message)
+        if progress is not None:
+            progress(message)
+    try:
+        LOG.info("etapa=sessao equipamento=%s status=iniciado", device["name"])
+        storage = manager.UnityXT(device["ip"], credentials["unity"])
+        rows = (collect_catalog_device(device, storage, verbosity, report) if catalog_only else
+                collect_device(device, storage, config, signals, now, sleep, verbosity, report))
+    except HandlerError:
+        raise
+    except Exception as error:
+        reason = state.failure_reason("{}; local={}".format(error_text(error), error_location(error)))
+        LOG.warning("etapa=equipamento equipamento=%s status=indisponivel motivo=%s", device["name"], reason)
+        rows = (unavailable_catalog(device, state.system, reason) if catalog_only else
+                unavailable_device_rows(device, state.system, state.completed, config, now, reason))
+    return rows
+
+
+def device_worker(sender, receiver, manager, credentials, device, config, signals, now, sleep, verbosity,
+                  catalog_only):
+    """Trabalha em grupo de processos próprio; só o pai escreve/publica o snapshot."""
+    receiver.close()
+    try:
+        os.setsid()
+        sender.send({"kind": "ready"})
+        rows = collect_unit(manager, credentials, device, config, signals, now, sleep, verbosity,
+                            sender.send, catalog_only)
+        sender.send({"kind": "result", "rows": rows})
+    except HandlerError as error:
+        sender.send({"kind": "fatal", "error": error_text(error)})
+    except Exception as error:
+        sender.send({"kind": "failure", "error": "{}; local={}".format(error_text(error), error_location(error))})
+    finally:
+        sender.close()
+
+
+def stop_device_worker(process, finished=False):
+    """Encerra/recolhe o filho e seu grupo, incluindo OpenSSL, com esperas curtas.
+
+    Usa SIGKILL após a margem de SIGTERM; não depende de o motor respeitar timeout.
+    O pipe dessa unidade é descartado, nunca reutilizado após encerramento forçado.
+    """
+    if finished:
+        # Permite saída normal/flush do filho após resultado ou erro controlado.
+        process.join(timeout=0.2)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            # O grupo usa o PID exclusivo do filho. Mesmo se a mensagem ready
+            # não chegou, esse alvo nunca é o grupo do processo principal.
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            if process.is_alive():
+                try:
+                    os.kill(process.pid, sig)
+                except ProcessLookupError:
+                    pass
+        process.join(timeout=0.2)
+
+
+def collect_bounded_device(manager, credentials, device, config, signals, now, sleep, verbosity=0,
+                           catalog_only=False):
+    """Supervisiona uma unidade em processo Linux/fork, com limites de parede.
+
+    Inclui criação da sessão, GET inicial, leitura dos corpos, paginação,
+    amostragem e OpenSSL. Nenhum timeout= é pressuposto na API externa. O pai
+    recebe eventos concluídos enquanto o filho trabalha, evitando join antes
+    da leitura de um resultado grande. A operação normal é sequencial por host.
+    """
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+    state = DeviceProgress(config)
+    process = context.Process(target=device_worker,
+                              args=(sender, receiver, manager, credentials, device, config,
+                                    signals, now, sleep, verbosity, catalog_only), name="unity-collector")
+    try:
+        process.start()
+    except Exception as error:
+        sender.close()
+        receiver.close()
+        raise CollectionError("Não foi possível iniciar a supervisão Linux: " + error_text(error)) from error
+    sender.close()
+    reason = None
+    finished = False
+    try:
+        while True:
+            deadline, limit = state.deadline()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = state.failure_reason("Tempo excedido: {}={}".format(limit, config.get(
+                    limit, {"device_timeout_seconds": DEVICE_TIMEOUT,
+                            "communication_timeout_seconds": COMMUNICATION_TIMEOUT,
+                            "request_timeout_seconds": REQUEST_TIMEOUT}[limit])))
+                break
+            try:
+                available = receiver.poll(min(remaining, 0.2))
+            except OSError:
+                reason = state.failure_reason("Canal de progresso da unidade indisponível.")
+                break
+            if not available:
+                if not process.is_alive():
+                    reason = state.failure_reason("Processo da unidade encerrou sem resultado; exit={}".format(process.exitcode))
+                    break
+                continue
+            try:
+                message = receiver.recv()
+            except (EOFError, OSError):
+                reason = state.failure_reason("Processo da unidade fechou a comunicação sem resultado.")
+                break
+            kind = message["kind"]
+            if kind == "result":
+                finished = True
+                return message["rows"]
+            if kind == "fatal":
+                finished = True
+                raise HandlerError(message["error"])
+            if kind == "failure":
+                finished = True
+                reason = state.failure_reason(message["error"])
+                break
+            state.update(message)
+    finally:
+        stop_device_worker(process, finished)
+        receiver.close()
+    LOG.warning("etapa=equipamento equipamento=%s status=indisponivel motivo=%s", device["name"], reason)
+    return (unavailable_catalog(device, state.system, reason) if catalog_only else
+            unavailable_device_rows(device, state.system, state.completed, config, now, reason))
+
+
 def collect_inventory(manager, credentials, devices, config, signals, now, sleep, verbosity=0):
-    """Cria UnityXT uma vez por equipamento; uma falha essencial cancela o ciclo."""
+    """Supervisiona cada unidade e segue após falhas de sessão, link ou timeout."""
     if verbosity >= 2 and len(devices) != 1:
         raise CollectionError("Respostas completas exigem diagnóstico de um único host.")
     rows = []
     for device in devices:
         try:
-            LOG.debug("etapa=sessao equipamento=%s status=iniciado", device["name"])
-            storage = manager.UnityXT(device["ip"], credentials["unity"])
-            rows.extend(collect_device(device, storage, config, signals, now, sleep, verbosity))
-        except Exception as error:
-            message = "etapa=coleta equipamento={} erro={} local={}; publicação cancelada.".format(
-                device["name"], error_text(error), error_location(error))
-            LOG.error("%s", message)
-            raise CollectionError(message) from error
+            unit_rows = collect_bounded_device(manager, credentials, device, config, signals, now, sleep, verbosity)
+        except HandlerError as error:
+            LOG.error("etapa=handler equipamento=%s publicado=false erro=%s", device["name"], error_text(error))
+            raise
+        rows.extend(unit_rows)
+        interrupted = any(row["source_details"].get("communication") for row in unit_rows)
+        LOG.info("etapa=equipamento equipamento=%s status=%s eventos=%d",
+                 device["name"], "comunicacao_interrompida" if interrupted else "concluido" if unit_rows else "fora_do_escopo",
+                 len(unit_rows))
     return rows
 
 
-def collect_metric_catalog(manager=None, host=None, verbosity=0):
+def unavailable_catalog(device, system, reason):
+    """Representa a unidade sem catálogo, sem confundir falha com lista vazia válida."""
+    system = system or {}
+    return {"device_info": {"name": device["name"], "type": system.get("model"),
+                            "serial_number": system.get("serialNumber")},
+            "collection_status": "unavailable", "collection_reason": reason, "metrics": None}
+
+
+def collect_catalog_device(device, storage, verbosity=0, progress=None):
+    """Consulta identidade/catálogo/serviço apenas por GET na sessão já existente."""
+    api = UnityAPI(storage, device["ip"], verbosity=verbosity, progress=progress)
+    api.device_name = device["name"]
+    system = probe_communication(api, device)
+    if system is None:
+        return None
+    metrics, diagnostics = read_resource(api, "metric", RESOURCES["metric"])
+    try:
+        service, _ = read_resource(api, "metricService", RESOURCES["metricService"])
+        service_error = None
+    except Exception as error:
+        service, service_error = None, error_text(error)
+    incomplete = api.communication_error or service_error or diagnostics.get("enrichment_error")
+    return {"device_info": {"name": device["name"], "type": system["model"],
+                            "serial_number": system["serialNumber"]},
+            "collection_status": "partial" if incomplete else "collected",
+            "collection_reason": "Catálogo recebido; parte das consultas falhou." if incomplete else "Catálogo recebido.",
+            "make_request_accepts_json": supports_json_body(storage), "metrics": metrics,
+            "metrics_service": service, "metrics_service_error": service_error, "query_details": diagnostics}
+
+
+def collect_metric_catalog(manager=None, host=None, verbosity=0, config=None):
     """Consulta o catálogo real sem publicar input_events.json ou criar query POST.
 
     Usa o inventário e a sessão do motor. Retorna tipo, unidade e disponibilidade
@@ -1623,29 +2017,15 @@ def collect_metric_catalog(manager=None, host=None, verbosity=0):
     """
     if verbosity >= 2 and host is None:
         raise CollectionError("Respostas completas exigem --host no diagnóstico de catálogo.")
+    config = config or {}
+    validate_config(config)
     manager, credentials, devices = load_inventory(manager, host)
     result = []
     for device in devices:
-        try:
-            storage = manager.UnityXT(device["ip"], credentials["unity"])
-            api = UnityAPI(storage, device["ip"], verbosity=verbosity)
-            api.device_name = device["name"]
-            system = identify_system(api, device)
-            if system is None:
-                continue
-            metrics, diagnostics = read_resource(api, "metric", RESOURCES["metric"])
-            try:
-                service, _ = read_resource(api, "metricService", RESOURCES["metricService"])
-                service_error = None
-            except Exception as error:
-                service, service_error = None, error_text(error)
-            result.append({"device_info": {"name": device["name"], "type": system["model"],
-                                           "serial_number": system["serialNumber"]},
-                           "make_request_accepts_json": supports_json_body(storage), "metrics": metrics,
-                           "metrics_service": service, "metrics_service_error": service_error,
-                           "query_details": diagnostics})
-        except Exception as error:
-            raise CollectionError("Catálogo de {} falhou: {}.".format(device["name"], error_text(error))) from error
+        entry = collect_bounded_device(manager, credentials, device, config, {}, None, time.sleep,
+                                       verbosity, catalog_only=True)
+        if entry is not None:
+            result.append(entry)
     if not result:
         raise CollectionError("Nenhum Unity XT 380F/480F elegível para consultar catálogo.")
     return result
@@ -1725,12 +2105,14 @@ def run_collection(output, manager=None, config=None, signals=None, now=None, sl
             respostas completas use collect_diagnostic_host com nível 2.
 
     Raises:
-        CollectionError: Inventário/identidade/handler/contrato inválido ou lock
+        CollectionError: Inventário/configuração/handler/contrato inválido ou lock
             ocupado. Exceções de I/O também são propagadas com etapa no log.
             Qualidade de medição indisponível é registrada, não vira zero.
 
-    O lock abrange coleta e publicação. Nenhum dado parcial muda o arquivo final;
-    o temporário oculto existe até a substituição ou a limpeza em erro.
+    O lock abrange coleta e publicação. Uma falha operacional de unidade não
+    cancela as outras: gera eventos indisponíveis ou conserva medições deste
+    ciclo com cobertura parcial. Sem identidade confirmada, modelo/serial ficam
+    None. O temporário oculto é validado completo antes da substituição.
     """
     if verbosity >= 2:
         raise CollectionError("Use diagnóstico --host -vv para respostas completas, sem publicar a entrada.")
@@ -1744,19 +2126,23 @@ def run_collection(output, manager=None, config=None, signals=None, now=None, sl
             validate_snapshot(snapshot)
         write_snapshot(temporary, snapshot)
         publish_snapshot(temporary, output)
-    LOG.info("etapa=ciclo status=concluido arquivo=%s equipamentos=%d registros=%d",
-             output, len(snapshot), len(rows))
+    failed = sum(any(event["source_details"].get("communication") for event in unit["events"].values())
+                 for unit in snapshot)
+    LOG.info("etapa=ciclo status=%s arquivo=%s equipamentos=%d equipamentos_com_falha=%d registros=%d",
+             "concluido_com_falhas" if failed else "concluido", output, len(snapshot), failed, len(rows))
     return snapshot
 
 
 def main(argv=None):
-    """CLI sem perguntas: retorna 0 em sucesso e 1 em erro operacional.
+    """CLI sem perguntas: 0 em ciclo concluído/publicado, 1 em falha global.
 
     --help e --list-handlers não importam o motor nem fazem consultas. --catalog-only
     consulta metadados e escreve JSON no stdout sem alterar o arquivo de entrada. Erros de
     argumentos são tratados pelo argparse com código 2. -v/--verbose mostra URLs
     e fields; -vv exige --host e inclui respostas. --host executa diagnóstico de
     uma unidade, sem publicar. Campos de autenticação são ocultados nos corpos.
+    Código 0 não comprova saúde/comunicação de todas as unidades: consulte
+    collection_status, source_details.communication e o resumo do ciclo.
     """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1767,11 +2153,11 @@ def main(argv=None):
                "  python3 %(prog)s --output /dados/input_events.json -v\n"
                "  python3 %(prog)s --host unity-prod -v\n"
                "  python3 %(prog)s --host unity-prod -vv 2> diagnostico_unity.log\n\n"
-               "Saída: 0 = sucesso; 1 = falha operacional; 2 = argumentos inválidos.\n"
+               "Saída: 0 = ciclo concluído (pode conter UNKNOWN); 1 = falha global; 2 = argumentos inválidos.\n"
                "Guia: MANUTENCAO_Coletor_Unity.md")
     parser.add_argument("--output", default="input_events.json",
                         help="JSON final observado pela automação (padrão: %(default)s).")
-    parser.add_argument("--config", help="JSON opcional de métricas e regras de messageId.")
+    parser.add_argument("--config", help="JSON opcional de métricas, regras de messageId e limites de tempo.")
     parser.add_argument("--signals", help="JSON de sinais recentes de segurança, por nome lógico.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v: URLs/fields e etapas; -vv: também corpos, exige --host.")
@@ -1796,12 +2182,14 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     try:
+        with collection_stage("leitura_arquivos"):
+            config = load_object(args.config)
         if args.catalog_only:
-            print(json.dumps(collect_metric_catalog(host=args.host, verbosity=args.verbose),
+            print(json.dumps(collect_metric_catalog(host=args.host, verbosity=args.verbose, config=config),
                              ensure_ascii=False, indent=2, allow_nan=False))
             return 0
         with collection_stage("leitura_arquivos"):
-            config, signals = load_object(args.config), load_object(args.signals)
+            signals = load_object(args.signals)
         if args.host:
             collect_diagnostic_host(args.host, config=config, signals=signals, verbosity=args.verbose)
         else:
