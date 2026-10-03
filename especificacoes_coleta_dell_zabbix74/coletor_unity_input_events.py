@@ -8,6 +8,8 @@ O JSON v2 publicado contém um objeto por unidade, com device_info e 25 events.
 Falhas de comunicação são isoladas por unidade, com sondagem REST inicial e
 limites de tempo supervisionados em processos Linux separados. Eventos sem
 medição ficam UNKNOWN; o arquivo final é substituído somente após validação.
+Até 4 equipamentos são coletados simultaneamente por padrão (--workers altera
+o limite). Resultados ficam em temporários ocultos individuais antes da união.
 
 Autenticação e sessão pertencem ao storage_api_manager do usuário. Linux/RHEL
 8 ou 9, Python 3.6+. Consulte README_Coletor_Unity.md para operação e
@@ -32,13 +34,15 @@ import tempfile
 import time
 import traceback
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from multiprocessing.connection import wait as wait_connections
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urljoin, urlsplit
 
 
 LOG = logging.getLogger("unity.collector")
+COLLECTOR_VERSION = "2026.10.03-paralelo"
 INPUT_FIELDS = (
     "family", "type", "name", "serial_number", "service_tag", "software_version",
     "health_status", "uptime_seconds", "datetime", "manufacturer_division",
@@ -101,6 +105,8 @@ COLLECTION_STATUSES = frozenset(("collected", "partial", "unavailable", "unsuppo
 COMMUNICATION_TIMEOUT = 30
 REQUEST_TIMEOUT = 30
 DEVICE_TIMEOUT = 300
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 32
 
 
 class CollectionError(RuntimeError):
@@ -1432,6 +1438,9 @@ def load_object(path):
 
 def validate_config(config):
     """Valida modos, intervalos, caminhos e regras antes de autenticar/coletar."""
+    workers = config.get("max_parallel_devices", DEFAULT_WORKERS)
+    if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= MAX_WORKERS:
+        raise CollectionError("max_parallel_devices deve ser inteiro entre 1 e {}.".format(MAX_WORKERS))
     if config.get("metrics_mode", "auto") not in ("auto", "historical", "realtime"):
         raise CollectionError("metrics_mode deve ser auto, historical ou realtime.")
     interval = config.get("sample_interval_seconds", 5)
@@ -1826,7 +1835,7 @@ def collect_unit(manager, credentials, device, config, signals, now, sleep, verb
 
     Sem modificar storage_api_manager, cria UnityXT uma vez. Erros de código
     de handlers continuam globais; falhas de sessão/sondagem geram 25 UNKNOWN.
-    Esta função não impõe tempo: a CLI usa collect_bounded_device para supervisão.
+    Esta função não impõe tempo: a CLI usa iter_device_results para supervisão.
     """
     state = DeviceProgress(config)
     def report(message):
@@ -1850,9 +1859,11 @@ def collect_unit(manager, credentials, device, config, signals, now, sleep, verb
 
 
 def device_worker(sender, receiver, manager, credentials, device, config, signals, now, sleep, verbosity,
-                  catalog_only):
+                  catalog_only, inherited_receivers=()):
     """Trabalha em grupo de processos próprio; só o pai escreve/publica o snapshot."""
     receiver.close()
+    for inherited in inherited_receivers:
+        inherited.close()
     try:
         os.setsid()
         sender.send({"kind": "ready"})
@@ -1890,21 +1901,32 @@ def stop_device_worker(process, finished=False):
         process.join(timeout=0.2)
 
 
-def collect_bounded_device(manager, credentials, device, config, signals, now, sleep, verbosity=0,
-                           catalog_only=False):
-    """Supervisiona uma unidade em processo Linux/fork, com limites de parede.
+class DeviceTask:
+    """Reúne processo, canal e progresso exclusivos de uma unidade em execução."""
 
-    Inclui criação da sessão, GET inicial, leitura dos corpos, paginação,
-    amostragem e OpenSSL. Nenhum timeout= é pressuposto na API externa. O pai
-    recebe eventos concluídos enquanto o filho trabalha, evitando join antes
-    da leitura de um resultado grande. A operação normal é sequencial por host.
-    """
-    context = multiprocessing.get_context("fork")
+    def __init__(self, index, device, progress, receiver, process):
+        """O índice conserva a ordem do inventário, independentemente da conclusão."""
+        self.index, self.device = index, device
+        self.progress, self.receiver, self.process = progress, receiver, process
+        self.finished = False
+
+    def close(self):
+        """Recolhe o processo/grupo e fecha seu canal mesmo quando há erro global."""
+        try:
+            stop_device_worker(self.process, self.finished)
+        finally:
+            self.receiver.close()
+
+
+def start_device_task(context, index, device, manager, credentials, config, signals, now, sleep,
+                      verbosity, catalog_only, inherited_receivers):
+    """Inicia um filho sem compartilhar sessão REST ou pipes de outras unidades."""
     receiver, sender = context.Pipe(duplex=False)
-    state = DeviceProgress(config)
+    progress = DeviceProgress(config)
     process = context.Process(target=device_worker,
                               args=(sender, receiver, manager, credentials, device, config,
-                                    signals, now, sleep, verbosity, catalog_only), name="unity-collector")
+                                    signals, now, sleep, verbosity, catalog_only, inherited_receivers),
+                              name="unity-collector")
     try:
         process.start()
     except Exception as error:
@@ -1912,70 +1934,184 @@ def collect_bounded_device(manager, credentials, device, config, signals, now, s
         receiver.close()
         raise CollectionError("Não foi possível iniciar a supervisão Linux: " + error_text(error)) from error
     sender.close()
-    reason = None
-    finished = False
+    return DeviceTask(index, device, progress, receiver, process)
+
+
+def poll_device_task(task, readable):
+    """Verifica prazo e uma mensagem; retorna (concluiu, resultado, motivo).
+
+    O supervisor chama esta função para TODAS as unidades a cada passagem.
+    Uma unidade silenciosa também vence seu prazo enquanto outras respondem.
+    """
+    state = task.progress
+    deadline, limit = state.deadline()
+    if deadline <= time.monotonic():
+        defaults = {"device_timeout_seconds": DEVICE_TIMEOUT,
+                    "communication_timeout_seconds": COMMUNICATION_TIMEOUT,
+                    "request_timeout_seconds": REQUEST_TIMEOUT}
+        reason = state.failure_reason("Tempo excedido: {}={}".format(limit, state.config.get(limit, defaults[limit])))
+        return True, None, reason
+    if not readable:
+        if task.process.is_alive():
+            return False, None, None
+        # O filho pode terminar DEPOIS de wait_connections() e deixar dados
+        # no pipe. Drene as mensagens antes de concluir que faltou resultado.
+        try:
+            readable = task.receiver.poll()
+        except OSError:
+            return True, None, state.failure_reason("Canal de progresso da unidade indisponível.")
+        if not readable:
+            reason = state.failure_reason("Processo da unidade encerrou sem resultado; exit={}".format(task.process.exitcode))
+            return True, None, reason
     try:
-        while True:
-            deadline, limit = state.deadline()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                reason = state.failure_reason("Tempo excedido: {}={}".format(limit, config.get(
-                    limit, {"device_timeout_seconds": DEVICE_TIMEOUT,
-                            "communication_timeout_seconds": COMMUNICATION_TIMEOUT,
-                            "request_timeout_seconds": REQUEST_TIMEOUT}[limit])))
-                break
-            try:
-                available = receiver.poll(min(remaining, 0.2))
-            except OSError:
-                reason = state.failure_reason("Canal de progresso da unidade indisponível.")
-                break
-            if not available:
-                if not process.is_alive():
-                    reason = state.failure_reason("Processo da unidade encerrou sem resultado; exit={}".format(process.exitcode))
-                    break
-                continue
-            try:
-                message = receiver.recv()
-            except (EOFError, OSError):
-                reason = state.failure_reason("Processo da unidade fechou a comunicação sem resultado.")
-                break
-            kind = message["kind"]
-            if kind == "result":
-                finished = True
-                return message["rows"]
-            if kind == "fatal":
-                finished = True
-                raise HandlerError(message["error"])
-            if kind == "failure":
-                finished = True
-                reason = state.failure_reason(message["error"])
-                break
-            state.update(message)
-    finally:
-        stop_device_worker(process, finished)
-        receiver.close()
-    LOG.warning("etapa=equipamento equipamento=%s status=indisponivel motivo=%s", device["name"], reason)
-    return (unavailable_catalog(device, state.system, reason) if catalog_only else
-            unavailable_device_rows(device, state.system, state.completed, config, now, reason))
+        message = task.receiver.recv()
+    except (EOFError, OSError):
+        return True, None, state.failure_reason("Processo da unidade fechou a comunicação sem resultado.")
+    kind = message["kind"]
+    if kind in ("result", "fatal", "failure"):
+        task.finished = True
+    if kind == "result":
+        return True, message["rows"], None
+    if kind == "fatal":
+        LOG.error("etapa=handler equipamento=%s publicado=false erro=%s", task.device["name"], message["error"])
+        raise HandlerError(message["error"])
+    if kind == "failure":
+        return True, None, state.failure_reason(message["error"])
+    state.update(message)
+    return False, None, None
 
 
-def collect_inventory(manager, credentials, devices, config, signals, now, sleep, verbosity=0):
-    """Supervisiona cada unidade e segue após falhas de sessão, link ou timeout."""
+def iter_device_results(manager, credentials, devices, config, signals, now, sleep, verbosity=0,
+                        workers=DEFAULT_WORKERS, catalog_only=False):
+    """Supervisiona até workers unidades e entrega resultados assim que terminam.
+
+    Yields:
+        (índice no inventário, equipamento, resultado). A ordem de conclusão
+        pode variar; o chamador reúne por índice. Cada vaga é preenchida assim
+        que fica disponível, sem aguardar a unidade mais lenta de um lote.
+
+    Os limites começam ao iniciar cada filho, sem contar espera na fila.
+    Falhas operacionais completam apenas aquela unidade. Erro de handler ou
+    encerramento do consumidor recolhe TODOS os filhos antes de propagar.
+    Use closing() ao consumir para garantir limpeza se a gravação falhar.
+    """
+    if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= MAX_WORKERS:
+        raise CollectionError("workers deve ser inteiro entre 1 e {}.".format(MAX_WORKERS))
     if verbosity >= 2 and len(devices) != 1:
         raise CollectionError("Respostas completas exigem diagnóstico de um único host.")
+    workers = min(workers, len(devices))
+    LOG.info("etapa=coleta equipamentos=%d workers=%d status=iniciado", len(devices), workers)
+    context = multiprocessing.get_context("fork")
+    active = OrderedDict()
+    next_index = 0
+    try:
+        while active or next_index < len(devices):
+            while next_index < len(devices) and len(active) < workers:
+                device = devices[next_index]
+                task = start_device_task(context, next_index, device, manager, credentials, config,
+                                         signals, now, sleep, verbosity, catalog_only, tuple(active))
+                active[task.receiver] = task
+                next_index += 1
+                LOG.info("etapa=supervisao equipamento=%s status=iniciado workers_ativos=%d",
+                         device["name"], len(active))
+            remaining = min(task.progress.deadline()[0] for task in active.values()) - time.monotonic()
+            readable = set(wait_connections(list(active), timeout=max(0, min(remaining, 0.2))))
+            for receiver, task in list(active.items()):
+                completed, result, reason = poll_device_task(task, receiver in readable)
+                if not completed:
+                    continue
+                # Fechar antes de entregar evita manter filhos enquanto o pai grava JSON.
+                task.close()
+                del active[receiver]
+                if reason is not None:
+                    state = task.progress
+                    LOG.warning("etapa=equipamento equipamento=%s status=indisponivel motivo=%s",
+                                task.device["name"], reason)
+                    result = (unavailable_catalog(task.device, state.system, reason) if catalog_only else
+                              unavailable_device_rows(task.device, state.system, state.completed, config, now, reason))
+                LOG.info("etapa=supervisao equipamento=%s status=finalizado duracao_segundos=%.3f",
+                         task.device["name"], time.monotonic() - task.progress.started)
+                yield task.index, task.device, result
+    finally:
+        for task in active.values():
+            task.close()
+
+
+def collect_bounded_device(manager, credentials, device, config, signals, now, sleep, verbosity=0,
+                           catalog_only=False):
+    """Supervisiona uma unidade com o mesmo mecanismo usado na coleta paralela.
+
+    Inclui sessão, sondagem, corpos REST, paginação, amostragem e OpenSSL.
+    Nenhum timeout= é pressuposto na API externa. workers=1 torna esta chamada
+    individual; collect_inventory() usa o limite configurado para o inventário.
+    """
+    with closing(iter_device_results(manager, credentials, [device], config, signals, now, sleep,
+                                     verbosity, workers=1, catalog_only=catalog_only)) as results:
+        return next(results)[2]
+
+
+@contextmanager
+def temporary_device_results(output):
+    """Cria diretório oculto 0700 por ciclo; remove os temporários ao sair.
+
+    Fica no diretório do input_events.json. Nenhum filho publica o arquivo
+    observado; o pai grava um resultado exclusivo por unidade concluída.
+    """
+    with collection_stage("preparacao_temporarios_equipamentos"):
+        directory = tempfile.TemporaryDirectory(prefix="." + output.name + ".unidades-", dir=str(output.parent))
+    with directory as path:
+        yield Path(path)
+
+
+def write_device_rows(directory, index, rows):
+    """Grava os registros de uma unidade em arquivo oculto 0600, sem publicação."""
+    path = directory / (".{:06d}.json.tmp".format(index))
+    with collection_stage("gravacao_temporaria_equipamento"):
+        with open(path, "x", encoding="utf-8") as target:
+            os.chmod(path, 0o600)
+            json.dump(rows, target, ensure_ascii=False, indent=2, allow_nan=False)
+            target.write("\n")
+            target.flush()
+            os.fsync(target.fileno())
+    LOG.debug("etapa=gravacao_temporaria_equipamento arquivo=%s registros=%d", path, len(rows))
+    return path
+
+
+def merge_device_rows(paths):
+    """Relê os temporários na ordem do inventário; a validação global vem depois."""
     rows = []
-    for device in devices:
-        try:
-            unit_rows = collect_bounded_device(manager, credentials, device, config, signals, now, sleep, verbosity)
-        except HandlerError as error:
-            LOG.error("etapa=handler equipamento=%s publicado=false erro=%s", device["name"], error_text(error))
-            raise
-        rows.extend(unit_rows)
-        interrupted = any(row["source_details"].get("communication") for row in unit_rows)
-        LOG.info("etapa=equipamento equipamento=%s status=%s eventos=%d",
-                 device["name"], "comunicacao_interrompida" if interrupted else "concluido" if unit_rows else "fora_do_escopo",
-                 len(unit_rows))
+    with collection_stage("uniao_temporarios_equipamentos"):
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as source:
+                unit_rows = json.load(source)
+            if not isinstance(unit_rows, list):
+                raise CollectionError("Temporário de equipamento precisa conter uma lista de registros.")
+            rows.extend(unit_rows)
     return rows
+
+
+def collect_inventory(manager, credentials, devices, config, signals, now, sleep, verbosity=0,
+                      staging_directory=None):
+    """Coleta várias unidades; preserva a ordem e isola falhas operacionais.
+
+    staging_directory: No ciclo publicado, cada conclusão vira um temporário
+        oculto e a união relê esses arquivos. Diagnóstico usa somente memória.
+    max_parallel_devices limita unidades; os handlers de cada uma mantêm a
+    execução sequencial e o compartilhamento de consultas na mesma sessão.
+    """
+    ordered = [None] * len(devices)
+    with collection_stage("coleta"), closing(iter_device_results(manager, credentials, devices, config, signals, now, sleep,
+                                     verbosity, workers=config.get("max_parallel_devices", DEFAULT_WORKERS))) as results:
+        for index, device, unit_rows in results:
+            ordered[index] = (write_device_rows(staging_directory, index, unit_rows)
+                              if staging_directory is not None else unit_rows)
+            interrupted = any(row["source_details"].get("communication") for row in unit_rows)
+            LOG.info("etapa=equipamento equipamento=%s status=%s eventos=%d",
+                     device["name"], "comunicacao_interrompida" if interrupted else "concluido" if unit_rows else "fora_do_escopo",
+                     len(unit_rows))
+    if staging_directory is not None:
+        return merge_device_rows(ordered)
+    return [row for unit_rows in ordered for row in unit_rows]
 
 
 def unavailable_catalog(device, system, reason):
@@ -2020,12 +2156,13 @@ def collect_metric_catalog(manager=None, host=None, verbosity=0, config=None):
     config = config or {}
     validate_config(config)
     manager, credentials, devices = load_inventory(manager, host)
-    result = []
-    for device in devices:
-        entry = collect_bounded_device(manager, credentials, device, config, {}, None, time.sleep,
-                                       verbosity, catalog_only=True)
-        if entry is not None:
-            result.append(entry)
+    ordered = [None] * len(devices)
+    with closing(iter_device_results(manager, credentials, devices, config, {}, None, time.sleep,
+                                     verbosity, workers=config.get("max_parallel_devices", DEFAULT_WORKERS),
+                                     catalog_only=True)) as results:
+        for index, device, entry in results:
+            ordered[index] = entry
+    result = [entry for entry in ordered if entry is not None]
     if not result:
         raise CollectionError("Nenhum Unity XT 380F/480F elegível para consultar catálogo.")
     return result
@@ -2097,7 +2234,8 @@ def run_collection(output, manager=None, config=None, signals=None, now=None, sl
     Args:
         output: Caminho observado pela automação para input_events.json.
         manager: Motor de autenticação injetado; None usa storage_api_manager.
-        config: Configuração opcional de métricas/regras, sem credenciais.
+        config: Configuração opcional de métricas/regras/limites, sem credenciais.
+            max_parallel_devices limita equipamentos simultâneos (padrão 4).
         signals: Sinais externos de segurança indexados pelo nome lógico.
         now: Horário UTC fixo para testes; None usa o relógio real.
         sleep: Espera de amostragem injetável; padrão time.sleep.
@@ -2112,15 +2250,19 @@ def run_collection(output, manager=None, config=None, signals=None, now=None, sl
     O lock abrange coleta e publicação. Uma falha operacional de unidade não
     cancela as outras: gera eventos indisponíveis ou conserva medições deste
     ciclo com cobertura parcial. Sem identidade confirmada, modelo/serial ficam
-    None. O temporário oculto é validado completo antes da substituição.
+    None. O pai grava temporários ocultos individuais, reúne na ordem do
+    inventário e valida o temporário final completo antes da substituição.
     """
     if verbosity >= 2:
         raise CollectionError("Use diagnóstico --host -vv para respostas completas, sem publicar a entrada.")
+    started = time.monotonic()
     config, signals = config or {}, signals or {}
     output = prepare_output(output, config)
-    with snapshot_lock(output), temporary_snapshot(output) as temporary:
+    with snapshot_lock(output), temporary_snapshot(output) as temporary, \
+            temporary_device_results(output) as staging_directory:
         manager, credentials, devices = load_inventory(manager)
-        rows = collect_inventory(manager, credentials, devices, config, signals, now, sleep, verbosity)
+        rows = collect_inventory(manager, credentials, devices, config, signals, now, sleep, verbosity,
+                                 staging_directory=staging_directory)
         with collection_stage("validacao"):
             snapshot = group_snapshot(rows)
             validate_snapshot(snapshot)
@@ -2128,26 +2270,30 @@ def run_collection(output, manager=None, config=None, signals=None, now=None, sl
         publish_snapshot(temporary, output)
     failed = sum(any(event["source_details"].get("communication") for event in unit["events"].values())
                  for unit in snapshot)
-    LOG.info("etapa=ciclo status=%s arquivo=%s equipamentos=%d equipamentos_com_falha=%d registros=%d",
-             "concluido_com_falhas" if failed else "concluido", output, len(snapshot), failed, len(rows))
+    LOG.info("etapa=ciclo status=%s arquivo=%s equipamentos=%d equipamentos_com_falha=%d registros=%d duracao_segundos=%.3f",
+             "concluido_com_falhas" if failed else "concluido", output, len(snapshot), failed, len(rows),
+             time.monotonic() - started)
     return snapshot
 
 
 def main(argv=None):
     """CLI sem perguntas: 0 em ciclo concluído/publicado, 1 em falha global.
 
+    --version identifica esta entrega sem importar o motor ou consultar hosts.
     --help e --list-handlers não importam o motor nem fazem consultas. --catalog-only
     consulta metadados e escreve JSON no stdout sem alterar o arquivo de entrada. Erros de
     argumentos são tratados pelo argparse com código 2. -v/--verbose mostra URLs
     e fields; -vv exige --host e inclui respostas. --host executa diagnóstico de
     uma unidade, sem publicar. Campos de autenticação são ocultados nos corpos.
-    Código 0 não comprova saúde/comunicação de todas as unidades: consulte
+    --workers/-j limita equipamentos simultâneos (padrão 4 ou config);
+    --workers 1 executa sequencialmente. Código 0 não comprova saúde/comunicação de todas as unidades: consulte
     collection_status, source_details.communication e o resumo do ciclo.
     """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exemplos:\n"
                "  python3 %(prog)s --output /dados/input_events.json --config config_unity.json\n"
+               "  python3 %(prog)s --output /dados/input_events.json --workers 4\n"
                "  python3 %(prog)s --list-handlers\n"
                "  python3 %(prog)s --catalog-only > catalogo_unity.json\n"
                "  python3 %(prog)s --output /dados/input_events.json -v\n"
@@ -2157,7 +2303,14 @@ def main(argv=None):
                "Guia: MANUTENCAO_Coletor_Unity.md")
     parser.add_argument("--output", default="input_events.json",
                         help="JSON final observado pela automação (padrão: %(default)s).")
-    parser.add_argument("--config", help="JSON opcional de métricas, regras de messageId e limites de tempo.")
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s {} | coleta paralela; workers_padrao={}; max_workers={}".format(
+                            COLLECTOR_VERSION, DEFAULT_WORKERS, MAX_WORKERS),
+                        help="Mostra versão e suporte a paralelismo, sem importar o motor ou coletar.")
+    parser.add_argument("--config", help="JSON opcional de métricas, regras de messageId, paralelismo e limites de tempo.")
+    parser.add_argument("--workers", "-j", type=int,
+                        help="Equipamentos simultâneos (1 a {}; padrão {} ou max_parallel_devices no config). "
+                             "Sobrescreve o config; 1 executa sequencialmente.".format(MAX_WORKERS, DEFAULT_WORKERS))
     parser.add_argument("--signals", help="JSON de sinais recentes de segurança, por nome lógico.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v: URLs/fields e etapas; -vv: também corpos, exige --host.")
@@ -2167,6 +2320,8 @@ def main(argv=None):
     parser.add_argument("--catalog-only", action="store_true",
                         help="Consulta catálogo real de métricas e imprime JSON; não publica input_events.json.")
     args = parser.parse_args(argv)
+    if args.workers is not None and not 1 <= args.workers <= MAX_WORKERS:
+        parser.error("--workers precisa estar entre 1 e {}.".format(MAX_WORKERS))
     if args.list_handlers:
         for event, handler in COLLECTION_HANDLERS.items():
             print("{} -> {}\n  {}".format(event, handler.__name__, inspect.getdoc(handler).splitlines()[0]))
@@ -2181,9 +2336,13 @@ def main(argv=None):
         parser.error("Use --host com -v/-vv ou --catalog-only para diagnóstico.")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    LOG.info("etapa=versao versao=%s suporte=paralelo workers_padrao=%d max_workers=%d",
+             COLLECTOR_VERSION, DEFAULT_WORKERS, MAX_WORKERS)
     try:
         with collection_stage("leitura_arquivos"):
             config = load_object(args.config)
+        if args.workers is not None:
+            config["max_parallel_devices"] = args.workers
         if args.catalog_only:
             print(json.dumps(collect_metric_catalog(host=args.host, verbosity=args.verbose, config=config),
                              ensure_ascii=False, indent=2, allow_nan=False))
