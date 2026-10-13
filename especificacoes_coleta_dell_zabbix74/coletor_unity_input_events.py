@@ -42,7 +42,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlencode, urljoin, urlsplit
 
 
 LOG = logging.getLogger("unity.collector")
-COLLECTOR_VERSION = "2026.10.03-paralelo"
+COLLECTOR_VERSION = "2026.10.13-metricas-paralelo"
 INPUT_FIELDS = (
     "family", "type", "name", "serial_number", "service_tag", "software_version",
     "health_status", "uptime_seconds", "datetime", "manufacturer_division",
@@ -90,6 +90,20 @@ RESOURCE_DETAILS = {
     "replicationSession": "srcStatus,dstStatus,maxTimeOutOfSync,lastSyncTime,localRole",
     "metric": "description",
 }
+# Campos opcionais consultados separadamente: rejeitar um campo de progresso
+# nao pode apagar RPO/lastSyncTime que o enriquecimento anterior ja confirmou.
+REPLICATION_PROGRESS_FIELDS = "syncProgress,currentTransferEstRemainingTime"
+PREFERRED_LATENCY_PATHS = {
+    "smb_latency_ms": "sp.*.cifs.global.basic.responseTime",
+    "nfs_latency_ms": "sp.*.nfs.basic.responseTime",
+}
+NETWORK_TRAFFIC_PATHS = {
+    "received": "sp.*.net.basic.inBytesRate",
+    "sent": "sp.*.net.basic.outBytesRate",
+}
+CONFIRMED_HISTORICAL_PATHS = frozenset(
+    tuple(PREFERRED_LATENCY_PATHS.values()) + tuple(NETWORK_TRAFFIC_PATHS.values()))
+HISTORICAL_INTERVAL_SECONDS = 300
 CPU_BUSY = "sp.*.cpu.summary.busyTicks"
 CPU_IDLE = "sp.*.cpu.summary.idleTicks"
 PERFORMANCE = {
@@ -429,11 +443,18 @@ def flatten_values(value, prefix=""):
     return {prefix.lstrip("/"): value} if value is not None else {}
 
 
-def metric_samples(entries, path, now, max_age):
-    """Agrupa amostras recentes por timestamp; ignora antigas e futuras incoerentes."""
+def metric_samples(entries, path, now, max_age, historical_interval=None):
+    """Agrupa amostras recentes; opcionalmente separa granularidade historica.
+
+    Consultas em tempo real nao possuem interval e continuam utilizaveis.
+    Historicos de 60/300 segundos nao sao sobrescritos no mesmo timestamp.
+    """
     result = {}
     for item in entries:
         if item.get("path") != path:
+            continue
+        if (historical_interval is not None and item.get("interval") is not None
+                and number(item["interval"]) != historical_interval):
             continue
         try:
             when = timestamp(item.get("timestamp"))
@@ -473,10 +494,20 @@ def counter_ratio(entries, numerator, denominator, now, max_age, cpu=False):
 
 
 def unit_factor(unit, field):
-    """Valida unidade e retorna o fator para milissegundos ou percentual."""
+    """Valida unidade e converte latencia media para ms ou percentual.
+
+    usec/op e o tempo medio por operacao, ja calculado pelo Unity. Converter
+    para ms requer fator 0.001; nao dividir novamente pelo numero de operacoes.
+    Unidades de vazao, como KB/s, nunca sao aceitas como percentuais.
+    """
     unit = str(unit).strip().casefold()
     if field.endswith("_ms"):
+        for suffix in ("/operations", "/operation", "/op"):
+            if unit.endswith(suffix):
+                unit = unit[:-len(suffix)].strip()
+                break
         return {"ms": 1, "millisecond": 1, "milliseconds": 1, "milissegundos": 1,
+                "msec": 1,
                 "us": .001, "µs": .001, "microseconds": .001, "microssegundos": .001,
                 "microsecond": .001, "μs": .001, "usec": .001,
                 "s": 1000, "second": 1000, "seconds": 1000, "segundos": 1000}.get(unit)
@@ -520,7 +551,11 @@ def choose_bindings(catalog, config):
             )
             if matches and metric.get("path"):
                 candidates.append({"path": metric["path"], "unit": metric["unitDisplayString"]})
-        if len(candidates) == 1:
+        preferred = PREFERRED_LATENCY_PATHS.get(field)
+        exact = next((candidate for candidate in candidates if candidate["path"] == preferred), None)
+        if exact is not None:
+            result[field] = exact
+        elif len(candidates) == 1:
             result[field] = candidates[0]
     return result
 
@@ -539,6 +574,12 @@ def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=tim
         for key in ("path", "numerator_path", "denominator_path"):
             if binding.get(key) in known:
                 paths.add(binding[key])
+    # Taxas auxiliares sao evidencias de trafego, nao a metrica percentual.
+    # Compartilham esta consulta e o cache; nao criam uma sessao por handler.
+    for path in NETWORK_TRAFFIC_PATHS.values():
+        metric = known.get(path, {})
+        if metric.get("type") in (4, 5) and metric.get("unitDisplayString") == "KB/s":
+            paths.add(path)
     if not paths:
         return [], "Nenhum caminho de métrica compatível foi encontrado no catálogo."
     collected, reasons = [], []
@@ -572,14 +613,22 @@ def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=tim
     if mode != "realtime":
         historical = sorted(path for path in paths if known[path].get("isHistoricalAvailable") is True)
         if historical:
-            path_filter = " or ".join('path eq "{}"'.format(path.replace('"', '\\"')) for path in historical)
-            expression = '({}) and timestamp gt "{}"'.format(path_filter, iso(now - timedelta(seconds=max_age)))
-            try:
-                collected.extend(api.collection("metricValue", "path,timestamp,interval,values", expression))
-            except Exception as error:
-                reasons.append("Métricas históricas: " + error_text(error))
-                LOG.warning("etapa=metricas equipamento=%s modo=historical erro=%s local=%s",
-                            api.device_name, error_text(error), error_location(error))
+            confirmed = [path for path in historical if path in CONFIRMED_HISTORICAL_PATHS]
+            other = [path for path in historical if path not in CONFIRMED_HISTORICAL_PATHS]
+            groups = ((HISTORICAL_INTERVAL_SECONDS, confirmed), (None, other))
+            for historical_interval, group in groups:
+                if not group:
+                    continue
+                path_filter = " or ".join('path eq "{}"'.format(path.replace('"', '\\"')) for path in group)
+                expression = '({}) and timestamp gt "{}"'.format(path_filter, iso(now - timedelta(seconds=max_age)))
+                if historical_interval is not None:
+                    expression += ' and interval eq "{}"'.format(historical_interval)
+                try:
+                    collected.extend(api.collection("metricValue", "path,timestamp,interval,values", expression))
+                except Exception as error:
+                    reasons.append("Métricas históricas: " + error_text(error))
+                    LOG.warning("etapa=metricas equipamento=%s modo=historical erro=%s local=%s",
+                                api.device_name, error_text(error), error_location(error))
     return collected, "; ".join(reasons) or "Amostras não disponíveis ou antigas."
 
 
@@ -635,6 +684,16 @@ def read_resource(api, resource, fields, filter_expression=None):
             diagnostics["enrichment_error"] = error_text(error)
             LOG.warning("etapa=enriquecimento equipamento=%s handler=%r recurso=%s erro=%s dados_basicos=preservados local=%s",
                         api.device_name, api.handler, resource, error_text(error), error_location(error))
+    if resource == "replicationSession" and items:
+        diagnostics["progress_fields"] = REPLICATION_PROGRESS_FIELDS
+        try:
+            progress = api.collection(resource, "id," + REPLICATION_PROGRESS_FIELDS, filter_expression)
+            by_id = {item.get("id"): item for item in progress if item.get("id") is not None}
+            items = [dict(item, **by_id.get(item.get("id"), {})) for item in items]
+        except Exception as error:
+            diagnostics["progress_error"] = error_text(error)
+            LOG.warning("etapa=progresso_replicacao equipamento=%s handler=%r erro=%s dados_anteriores=preservados local=%s",
+                        api.device_name, api.handler, error_text(error), error_location(error))
     return items, diagnostics
 
 
@@ -777,7 +836,7 @@ class CollectionContext:
         query_issues = {}
         for resource in sorted(self.handler_resources):
             info = self.resource_details.get(resource, {})
-            errors = {key: info[key] for key in ("fields_error", "enrichment_error") if info.get(key)}
+            errors = {key: info[key] for key in ("fields_error", "enrichment_error", "progress_error") if info.get(key)}
             if errors:
                 query_issues[resource] = errors
         if query_issues:
@@ -1023,7 +1082,10 @@ def collect_performance(context, event, field):
         path = binding.get("path")
         metric = known.get(path, {})
         factor = unit_factor(binding.get("unit", metric.get("unitDisplayString", "")), field)
-        samples = metric_samples(entries, path, finished, max_age)
+        if field.endswith("_pct") and path in NETWORK_TRAFFIC_PATHS.values():
+            factor = None  # Uma taxa de trafego nao vira percentual por override de unidade.
+        historical_interval = HISTORICAL_INTERVAL_SECONDS if path in CONFIRMED_HISTORICAL_PATHS else None
+        samples = metric_samples(entries, path, finished, max_age, historical_interval)
         reason = "Caminho/unidade incompatível, contador sem fórmula, ou amostra ausente/antiga."
         if metric.get("type") in (4, 5) and factor is not None and samples:
             sample_time = max(samples)
@@ -1150,9 +1212,52 @@ def collect_storage_utilization(context):
                          pool["source_details"]["observations"], storage_utilization_pct=pool["usage_percentage"])
 
 
+def network_traffic_observations(metrics):
+    """Descreve as taxas KB/s por SP, sem inventar capacidade ou percentual.
+
+    Cada direcao conserva seu timestamp. Se recebimento e envio vieram de
+    periodos diferentes, timestamps_aligned=False impede trata-los como uma
+    unica amostra sincronizada em uma futura formula de utilizacao.
+    """
+    known = {item.get("path"): item for item in metrics["catalog"]}
+    result = {}
+    times = []
+    for direction, path in NETWORK_TRAFFIC_PATHS.items():
+        metric = known.get(path, {})
+        if metric.get("type") not in (4, 5) or metric.get("unitDisplayString") != "KB/s":
+            continue
+        samples = metric_samples(metrics["entries"], path, metrics["finished"],
+                                 metrics["max_age"], HISTORICAL_INTERVAL_SECONDS)
+        if not samples:
+            continue
+        latest = max(samples)
+        values = {key: value for key, value in samples[latest].items() if value >= 0}
+        if values:
+            times.append(latest)
+            result[direction] = {"path": path, "unit": "KB/s", "sample_time": iso(latest),
+                                 "per_instance": values}
+    if result:
+        result["scope"] = "per_storage_processor"
+        result["timestamps_aligned"] = len(times) == 2 and times[0] == times[1]
+        result["capacity_reference_available"] = False
+    return result
+
+
 def collect_network_utilization(context):
-    """Network utilization: catálogo/amostras metric -> network_utilization_pct."""
-    return collect_performance(context, "Network utilization", "network_utilization_pct")
+    """Network utilization: percentual validado e trafego auxiliar por SP.
+
+    inBytesRate/outBytesRate em KB/s ficam somente em source_details. Sem
+    percentual nativo/formula validada, network_utilization_pct continua null.
+    """
+    row = collect_performance(context, "Network utilization", "network_utilization_pct")
+    traffic = network_traffic_observations(context.metrics())
+    if traffic:
+        row["source_details"]["observations"]["traffic"] = traffic
+        if row["collection_status"] == "unsupported":
+            reason = ("Tráfego medido em KB/s por SP; falta capacidade das interfaces de mesmo escopo "
+                      "para calcular network_utilization_pct. Não é um percentual nativo.")
+            row["collection_reason"] = row["custom_description"] = reason
+    return row
 
 
 def collect_packet_loss(context):
@@ -1219,15 +1324,25 @@ def collect_replication_lag(context):
     for session in sessions:
         record = {"id": session.get("id"), "rpo_minutes": session.get("maxTimeOutOfSync"),
                   "last_sync_time": session.get("lastSyncTime")}
+        for source, target in (("name", "name"), ("syncState", "sync_state"),
+                               ("health", "health"), ("syncProgress", "sync_progress"),
+                               ("currentTransferEstRemainingTime", "transfer_estimated_remaining_time")):
+            if session.get(source) is not None:
+                record[target] = session[source]
         try:
             age = (context.started - timestamp(session.get("lastSyncTime"))).total_seconds() / 60
             record["last_completed_sync_age_minutes"] = max(0, age)
+            if age < 0:
+                record["last_sync_timestamp_in_future"] = True
         except ValueError:
             pass
         observations.append(record)
     return context.event(event, "unsupported",
-                         "lastSyncTime não mede atraso real/RPO atual; requer uma métrica de lag validada.",
-                         {"sessions": observations}, is_replication_configured=True)
+                         "lastSyncTime não mede atraso real/RPO atual; requer uma métrica de lag validada. "
+                         "RPO configurado, idade da última sincronização e progresso estão no diagnóstico; "
+                         "tempo restante da transferência não representa lag_minutes.",
+                         {"sessions": observations, "measurement": "last_sync_age_diagnostic",
+                          "lag_measurement_available": False}, is_replication_configured=True)
 
 
 def collect_nfs_service(context):
