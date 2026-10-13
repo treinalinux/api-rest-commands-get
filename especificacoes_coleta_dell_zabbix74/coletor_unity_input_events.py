@@ -42,7 +42,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlencode, urljoin, urlsplit
 
 
 LOG = logging.getLogger("unity.collector")
-COLLECTOR_VERSION = "2026.10.13-metricas-paralelo"
+COLLECTOR_VERSION = "2026.10.13-compat-fields"
 INPUT_FIELDS = (
     "family", "type", "name", "serial_number", "service_tag", "software_version",
     "health_status", "uptime_seconds", "datetime", "manufacturer_division",
@@ -90,9 +90,6 @@ RESOURCE_DETAILS = {
     "replicationSession": "srcStatus,dstStatus,maxTimeOutOfSync,lastSyncTime,localRole",
     "metric": "description",
 }
-# Campos opcionais consultados separadamente: rejeitar um campo de progresso
-# nao pode apagar RPO/lastSyncTime que o enriquecimento anterior ja confirmou.
-REPLICATION_PROGRESS_FIELDS = "syncProgress,currentTransferEstRemainingTime"
 PREFERRED_LATENCY_PATHS = {
     "smb_latency_ms": "sp.*.cifs.global.basic.responseTime",
     "nfs_latency_ms": "sp.*.nfs.basic.responseTime",
@@ -560,6 +557,19 @@ def choose_bindings(catalog, config):
     return result
 
 
+def read_confirmed_historical_metric(api, path):
+    """Usa o GET de metricValue confirmado no Unity, sem fields nem compact.
+
+    path/timestamp/interval/values fazem parte do payload de metricValue;
+    nao precisam ser pedidos como atributos de uma colecao de hardware.
+    Um caminho por consulta impede uma rejeicao de invalidar os demais.
+    A selecao de amostras recentes permanece no consumidor, em metric_samples.
+    """
+    expression = '(path EQ "{}") AND interval EQ "{}"'.format(
+        path.replace('"', '\\"'), HISTORICAL_INTERVAL_SECONDS)
+    return api.collection("metricValue", filter_expression=expression, compact=False)
+
+
 def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=time.sleep):
     """Busca uma única série compartilhada pelos handlers de desempenho.
 
@@ -596,8 +606,9 @@ def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=tim
             # Três intervalos dão margem para duas amostras de contadores.
             for _ in range(3):
                 sleep(interval)
-                collected.extend(api.collection("metricQueryResult", "queryId,path,timestamp,values",
-                                                "queryId eq {}".format(query_id)))
+                collected.extend(api.collection("metricQueryResult",
+                                                filter_expression="queryId eq {}".format(query_id),
+                                                compact=False))
         except Exception as error:
             reasons.append("Métricas em tempo real: " + error_text(error))
             LOG.warning("etapa=metricas equipamento=%s modo=realtime erro=%s local=%s",
@@ -612,23 +623,25 @@ def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=tim
                                 api.device_name, query_id, error_text(error), error_location(error))
     if mode != "realtime":
         historical = sorted(path for path in paths if known[path].get("isHistoricalAvailable") is True)
-        if historical:
-            confirmed = [path for path in historical if path in CONFIRMED_HISTORICAL_PATHS]
-            other = [path for path in historical if path not in CONFIRMED_HISTORICAL_PATHS]
-            groups = ((HISTORICAL_INTERVAL_SECONDS, confirmed), (None, other))
-            for historical_interval, group in groups:
-                if not group:
-                    continue
-                path_filter = " or ".join('path eq "{}"'.format(path.replace('"', '\\"')) for path in group)
-                expression = '({}) and timestamp gt "{}"'.format(path_filter, iso(now - timedelta(seconds=max_age)))
-                if historical_interval is not None:
-                    expression += ' and interval eq "{}"'.format(historical_interval)
-                try:
-                    collected.extend(api.collection("metricValue", "path,timestamp,interval,values", expression))
-                except Exception as error:
-                    reasons.append("Métricas históricas: " + error_text(error))
-                    LOG.warning("etapa=metricas equipamento=%s modo=historical erro=%s local=%s",
-                                api.device_name, error_text(error), error_location(error))
+        confirmed = [path for path in historical if path in CONFIRMED_HISTORICAL_PATHS]
+        for path in confirmed:
+            try:
+                collected.extend(read_confirmed_historical_metric(api, path))
+            except Exception as error:
+                reasons.append("Métricas históricas ({}): {}".format(path, error_text(error)))
+                LOG.warning("etapa=metricas equipamento=%s modo=historical path=%s intervalo=%d erro=%s local=%s",
+                            api.device_name, path, HISTORICAL_INTERVAL_SECONDS,
+                            error_text(error), error_location(error))
+        other = [path for path in historical if path not in CONFIRMED_HISTORICAL_PATHS]
+        if other:
+            path_filter = " or ".join('path eq "{}"'.format(path.replace('"', '\\"')) for path in other)
+            expression = '({}) and timestamp gt "{}"'.format(path_filter, iso(now - timedelta(seconds=max_age)))
+            try:
+                collected.extend(api.collection("metricValue", filter_expression=expression, compact=False))
+            except Exception as error:
+                reasons.append("Métricas históricas: " + error_text(error))
+                LOG.warning("etapa=metricas equipamento=%s modo=historical paths=%s erro=%s local=%s",
+                            api.device_name, ",".join(other), error_text(error), error_location(error))
     return collected, "; ".join(reasons) or "Amostras não disponíveis ou antigas."
 
 
@@ -684,16 +697,6 @@ def read_resource(api, resource, fields, filter_expression=None):
             diagnostics["enrichment_error"] = error_text(error)
             LOG.warning("etapa=enriquecimento equipamento=%s handler=%r recurso=%s erro=%s dados_basicos=preservados local=%s",
                         api.device_name, api.handler, resource, error_text(error), error_location(error))
-    if resource == "replicationSession" and items:
-        diagnostics["progress_fields"] = REPLICATION_PROGRESS_FIELDS
-        try:
-            progress = api.collection(resource, "id," + REPLICATION_PROGRESS_FIELDS, filter_expression)
-            by_id = {item.get("id"): item for item in progress if item.get("id") is not None}
-            items = [dict(item, **by_id.get(item.get("id"), {})) for item in items]
-        except Exception as error:
-            diagnostics["progress_error"] = error_text(error)
-            LOG.warning("etapa=progresso_replicacao equipamento=%s handler=%r erro=%s dados_anteriores=preservados local=%s",
-                        api.device_name, api.handler, error_text(error), error_location(error))
     return items, diagnostics
 
 
@@ -836,7 +839,7 @@ class CollectionContext:
         query_issues = {}
         for resource in sorted(self.handler_resources):
             info = self.resource_details.get(resource, {})
-            errors = {key: info[key] for key in ("fields_error", "enrichment_error", "progress_error") if info.get(key)}
+            errors = {key: info[key] for key in ("fields_error", "enrichment_error") if info.get(key)}
             if errors:
                 query_issues[resource] = errors
         if query_issues:
@@ -1311,6 +1314,8 @@ def collect_replication_lag(context):
 
     Idade da última sincronização concluída não mede lag real. Sem fonte validada,
     retorna unsupported e mantém lag_minutes/rpo_minutes ausentes nas medições.
+    Progresso e tempo restante sao preservados se ja vierem na resposta;
+    nao solicita campos adicionais na leitura compartilhada com Replication Failed.
     """
     event = "Replication Lag"
     unavailable = context.unavailable(event, ["replicationSession"])
@@ -1339,7 +1344,8 @@ def collect_replication_lag(context):
         observations.append(record)
     return context.event(event, "unsupported",
                          "lastSyncTime não mede atraso real/RPO atual; requer uma métrica de lag validada. "
-                         "RPO configurado, idade da última sincronização e progresso estão no diagnóstico; "
+                         "RPO configurado e idade da última sincronização estão no diagnóstico. "
+                         "Progresso/tempo restante são preservados quando fornecidos pela fonte; "
                          "tempo restante da transferência não representa lag_minutes.",
                          {"sessions": observations, "measurement": "last_sync_age_diagnostic",
                           "lag_measurement_available": False}, is_replication_configured=True)
