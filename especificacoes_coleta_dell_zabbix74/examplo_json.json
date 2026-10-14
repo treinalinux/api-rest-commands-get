@@ -1,0 +1,164 @@
+{
+  "device_info": {
+    "family": "Unity",
+    "type": "Storage",
+    "name": "unity-caos-total",
+    "serial_number": "SN-EXEMPLO-UNITY-RIO",
+    "service_tag": "TAG-UNITY-RIO"
+  },
+  "availability": [
+    {
+      "{#COMPONENTE}": "cluster_down",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. quorum do cluster operando normalmente."
+    },
+    {
+      "{#COMPONENTE}": "controller_down",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. todas as 2 controladoras ativas.",
+      "{#METRICA}": 2
+    },
+    {
+      "{#COMPONENTE}": "multiple_disk_failure",
+      "{#STATUS}": "OPERATIONAL",
+      "{#DESCRICAO}": "aviso: 1 disco falho. operacional via redundancia. componente afetado: disk-03, enclosure enclosure-exemplo-01, slot 3, nao spare.",
+      "{#METRICA}": 24
+    },
+    {
+      "{#COMPONENTE}": "power_supply_failure",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. todas as 2 fontes de alimentacao saudaveis.",
+      "{#METRICA}": 2
+    },
+    {
+      "{#COMPONENTE}": "fan_failure",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. todas as 6 fans saudaveis.",
+      "{#METRICA}": 6
+    },
+    {
+      "{#COMPONENTE}": "high_temp",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. temperatura normal: 25 graus celsius.",
+      "{#METRICA}": 25.0
+    }
+  ],
+  "performance": [
+    {
+      "{#COMPONENTE}": "smb_latency",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. latencia smb normal: 0.8 ms.",
+      "{#METRICA}": 0.8
+    },
+    {
+      "{#COMPONENTE}": "nfs_latency",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. latencia nfs normal: 2.9 ms.",
+      "{#METRICA}": 2.9
+    },
+    {
+      "{#COMPONENTE}": "nfs_retransmissions",
+      "{#STATUS}": "unsupported",
+      "{#DESCRICAO}": "percentual de retransmissoes nfs sem fonte de medicao validada.",
+      "{#METRICA}": null
+    },
+    {
+      "{#COMPONENTE}": "cpu_utilization",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. utilizacao media de cpu: 78%.",
+      "{#METRICA}": 78.0
+    },
+    {
+      "{#COMPONENTE}": "storage_utilization",
+      "{#STATUS}": "WARNING",
+      "{#DESCRICAO}": "aviso: ocupacao do pool mais utilizado em 92%. limite: 85%. pool afetado: pool-dados.",
+      "{#METRICA}": 92.0
+    },
+    {
+      "{#COMPONENTE}": "network_utilization",
+      "{#STATUS}": "unsupported",
+      "{#DESCRICAO}": "percentual de utilizacao de rede sem fonte validada. o trafego em kb/s nao fornece a capacidade necessaria para calcular o percentual.",
+      "{#METRICA}": null
+    },
+    {
+      "{#COMPONENTE}": "packet_loss",
+      "{#STATUS}": "unsupported",
+      "{#DESCRICAO}": "percentual de perda de pacotes sem fonte de medicao validada.",
+      "{#METRICA}": null
+    },
+    {
+      "{#COMPONENTE}": "controller_cpu",
+      "{#STATUS}": "WARNING",
+      "{#DESCRICAO}": "aviso: maior utilizacao de cpu entre as controladoras em 91%. limite de aviso: 85%.",
+      "{#METRICA}": 91.0
+    },
+    {
+      "{#COMPONENTE}": "volume_usage",
+      "{#STATUS}": "WARNING",
+      "{#DESCRICAO}": "aviso: maior ocupacao entre os volumes em 83%. limite: 80%. volume afetado: volume-dados, id fs_01.",
+      "{#METRICA}": 83.0
+    },
+    {
+      "{#COMPONENTE}": "pool_usage",
+      "{#STATUS}": "WARNING",
+      "{#DESCRICAO}": "aviso: maior ocupacao entre os pools em 92%. limite: 90%. pool afetado: pool-dados, id pool_01.",
+      "{#METRICA}": 92.0
+    },
+    {
+      "{#COMPONENTE}": "pool_full",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. maior ocupacao entre os pools em 92%, abaixo do limite critico de 95%. pool: pool-dados, id pool_01.",
+      "{#METRICA}": 92.0
+    }
+  ],
+  "protection": [
+    {
+      "{#COMPONENTE}": "replication_failed",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. nenhuma sessao de replicacao com falha confirmada.",
+      "{#METRICA}": 0
+    },
+    {
+      "{#COMPONENTE}": "replication_lag",
+      "{#STATUS}": "unsupported",
+      "{#DESCRICAO}": "atraso real de replicacao sem fonte de medicao validada. a idade da ultima sincronizacao nao representa lag.",
+      "{#METRICA}": null
+    },
+    {
+      "{#COMPONENTE}": "nfs_service",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. servico nfs configurado e saude de gestao do nas server normal.",
+      "{#METRICA}": 1
+    },
+    {
+      "{#COMPONENTE}": "smb_service",
+      "{#STATUS}": "OK",
+      "{#DESCRICAO}": "status ok. servico smb configurado e saude de gestao do nas server normal.",
+      "{#METRICA}": 1
+    },
+    {
+      "{#COMPONENTE}": "audit_disabled",
+      "{#STATUS}": "unsupported",
+      "{#DESCRICAO}": "estado de auditoria sem fonte validada para informar se esta habilitada ou desabilitada.",
+      "{#METRICA}": null
+    },
+    {
+      "{#COMPONENTE}": "unauthorized_admin",
+      "{#STATUS}": "CRITICAL",
+      "{#DESCRICAO}": "alerta ativo de acesso nao autorizado ou falha de autenticacao no unity. verificar a descricao e a origem da tentativa.",
+      "{#METRICA}": 1
+    },
+    {
+      "{#COMPONENTE}": "certificate_expiring",
+      "{#STATUS}": "WARNING",
+      "{#DESCRICAO}": "aviso: certificado https de gestao expira em 10 dias. limite de aviso: 30 dias.",
+      "{#METRICA}": 10
+    },
+    {
+      "{#COMPONENTE}": "ransomware_pattern",
+      "{#STATUS}": "WARNING",
+      "{#DESCRICAO}": "protecao antivirus cava desabilitada ou sem configuracao no nas nas-arquivos-01. este estado nao representa deteccao de ransomware.",
+      "{#METRICA}": 1
+    }
+  ]
+}
