@@ -42,7 +42,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlencode, urljoin, urlsplit
 
 
 LOG = logging.getLogger("unity.collector")
-COLLECTOR_VERSION = "2026.10.13-metricas-limitadas"
+COLLECTOR_VERSION = "2026.10.14-seguranca-logs"
 INPUT_FIELDS = (
     "family", "type", "name", "serial_number", "service_tag", "software_version",
     "health_status", "uptime_seconds", "datetime", "manufacturer_division",
@@ -120,6 +120,42 @@ REQUEST_TIMEOUT = 30
 DEVICE_TIMEOUT = 300
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 32
+UNAUTHORIZED_DESCRIPTION_PATTERNS = ("unauthorized", "login failed")
+MAX_SECURITY_ALERT_DETAILS = 20
+
+
+class CollectorLogFilter(logging.Filter):
+    """Mantém o diagnóstico do coletor e avisos/erros de bibliotecas externas.
+
+    Logs INFO/DEBUG do motor de autenticação não são reemitidos pelo coletor.
+    O filtro atua apenas nos handlers configurados pela CLI, sem mudar a sessão.
+    """
+
+    def filter(self, record):
+        """Aceita logs deste coletor ou falhas de qualquer logger."""
+        return (record.name == LOG.name or record.name.startswith(LOG.name + ".")
+                or record.levelno >= logging.WARNING)
+
+
+def configure_logging(verbosity=0):
+    """Configura stderr: operação resumida; -v/-vv liberam etapas em DEBUG.
+
+    Deve ser chamada pela CLI, não ao importar o módulo. A consulta e os corpos
+    continuam sujeitos a verbosity e à ocultação de credenciais em UnityAPI.
+    """
+    level = logging.DEBUG if verbosity else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger().setLevel(level)
+    LOG.setLevel(level)
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(item, CollectorLogFilter) for item in handler.filters):
+            handler.addFilter(CollectorLogFilter())
+
+
+def quality_summary(rows):
+    """Resume a qualidade dos eventos de uma unidade/ciclo em uma linha."""
+    return ",".join("{}:{}".format(status, sum(row.get("collection_status") == status for row in rows))
+                    for status in sorted(COLLECTION_STATUSES))
 
 
 class CollectionError(RuntimeError):
@@ -451,7 +487,7 @@ class UnityAPI:
         except RESTError as error:
             if error.status not in (400, 422):
                 raise
-            LOG.info("etapa=compatibilidade_metricas equipamento=%s recurso=%s http_status=%d "
+            LOG.debug("etapa=compatibilidade_metricas equipamento=%s recurso=%s http_status=%d "
                      "tentativa=apenas_filtro paginas_seguidas=0",
                      self.device_name, resource, error.status)
             payload = self.request("GET", resource_path + "?" + urlencode({"filter": filter_expression}))
@@ -870,6 +906,20 @@ class CollectionContext:
                       self.device["name"], self.api.handler, resource)
         return self._resources[resource]
 
+    def cached_resource(self, resource):
+        """Lê somente um recurso já consultado, registrando a dependência do handler.
+
+        None significa cache ausente ou consulta anterior indisponível. Nunca
+        inicia GET, login ou tentativa adicional; útil para contexto opcional.
+        """
+        if resource not in RESOURCES:
+            raise KeyError(resource)
+        if resource in self._resources:
+            self.handler_resources.add(resource)
+            LOG.debug("etapa=cache equipamento=%s handler=%r recurso=%s", self.device["name"],
+                      self.api.handler, resource)
+        return self._resources.get(resource)
+
     def event(self, event, status="collected", reason="Consulta REST concluída.", details=None, **values):
         """Cria um registro com 44 campos, qualidade e origem, sem valores fictícios.
 
@@ -913,7 +963,7 @@ class CollectionContext:
         self.handler_resources.update(("metric", "metricService"))
         if self._metrics is None:
             catalog, entries, bindings, reason = [], [], {}, ""
-            LOG.info("etapa=metricas equipamento=%s status=iniciado", self.device["name"])
+            LOG.debug("etapa=metricas equipamento=%s status=iniciado", self.device["name"])
             try:
                 catalog = self.resource("metric")
                 if catalog is None:
@@ -1415,8 +1465,55 @@ def collect_audit_disabled(context):
 
 
 def collect_unauthorized_admin(context):
-    """Unauthorized Admin: alerta/sinal externo validado -> has_unauthorized_admin."""
-    return collect_security(context, "Unauthorized Admin", "has_unauthorized_admin")
+    """Unauthorized Admin: alertas ativos Unauthorized/Login failed ou sinal validado.
+
+    Reutiliza a consulta alert com state 0/1 e fields conhecidos. A busca textual
+    em description é insensível a maiúsculas, equivalente a lk "%...%", sem GET
+    adicional nem leitura de histórico. False significa nenhum alerta ativo
+    compatível nesta resposta; não comprova ausência de invasão. Um Login failed
+    é uma tentativa malsucedida e não confirma acesso nem função administrativa.
+    Sinais externos recentes e messageIds configurados conservam precedência.
+    """
+    event, field = "Unauthorized Admin", "has_unauthorized_admin"
+    row = collect_security(context, event, field)
+    if isinstance(row.get(field), bool):
+        return row
+    alerts = context.resource("alert")
+    details = {"security_scope": "active_unity_alerts", "resource": "alert",
+               "description_patterns": list(UNAUTHORIZED_DESCRIPTION_PATTERNS)}
+    if alerts is None:
+        return context.event(event, "unavailable", context.resource_errors["alert"], details)
+    matches, incomplete = [], 0
+    for alert in alerts:
+        state = alert.get("state")
+        if not isinstance(state, int) or isinstance(state, bool):
+            incomplete += 1
+            continue
+        if state not in (0, 1):
+            continue
+        description = alert.get("description")
+        if not isinstance(description, str) or not description.strip():
+            incomplete += 1
+            continue
+        matched = [pattern for pattern in UNAUTHORIZED_DESCRIPTION_PATTERNS
+                   if pattern in description.casefold()]
+        if matched:
+            matches.append({"id": alert.get("id"), "state": state,
+                            "severity": alert.get("severity"), "messageId": alert.get("messageId"),
+                            "timestamp": alert.get("timestamp"), "description": description,
+                            "matched_patterns": matched})
+    details.update(matched_alert_count=len(matches), incomplete_alert_count=incomplete,
+                   alerts=matches[:MAX_SECURITY_ALERT_DETAILS],
+                   omitted_alert_count=max(0, len(matches) - MAX_SECURITY_ALERT_DETAILS))
+    if matches:
+        return context.event(event, "partial" if incomplete else "collected",
+                             "alerta ativo de acesso nao autorizado ou falha de autenticacao no unity",
+                             details, **{field: True})
+    if incomplete:
+        return context.event(event, "unavailable",
+                             "resposta de alertas incompleta; nao foi possivel avaliar todas as descricoes", details)
+    return context.event(event, reason="nenhum alerta ativo com descricao unauthorized ou login failed no unity",
+                         details=details, **{field: False})
 
 
 def collect_certificate_expiring(context):
@@ -1441,36 +1538,84 @@ def collect_certificate_expiring(context):
                          details=details, days_to_expire=details["days_to_expire"])
 
 
-def antivirus_configuration(context):
-    """Resume virusChecker como configuração CAVA, sem inferir infecção/ransomware.
+def antivirus_server_details(item, names):
+    """Identifica o checker e seu NAS; nome ausente conserva o ID original."""
+    nas_id = reference(item.get("nasServer"))
+    return {"id": item.get("id"), "nas_server_id": nas_id,
+            "nas_server_name": names.get(nas_id) or nas_id, "isEnabled": item.get("isEnabled")}
 
-    isEnabled indica habilitação por NAS server. O resumo evita copiar uma
-    coleção inteira ao evento; o corpo completo está disponível em -vv.
+
+def antivirus_configuration(context):
+    """Resume habilitação CAVA por NAS, incluindo SMB sem configuração.
+
+    Reutiliza relações de nasServer para identificar NAS SMB e detectar
+    configurações ausentes. isEnabled mede configuração, não disponibilidade do
+    motor externo nem detecção de malware. Guarda contagens e NAS com problemas;
+    a lista completa de respostas permanece disponível somente em -vv.
     """
     checkers = context.resource("virusChecker")
     result = {"resource": "virusChecker", "scope": "nas_antivirus_configuration"}
     if checkers is None:
         result.update(collection_status="unavailable", query_error=context.resource_errors["virusChecker"])
         return result
+    nas_servers = context.resource("nasServer")
+    names = {item.get("id"): item.get("name", item.get("id")) for item in (nas_servers or [])}
+    coverage = nas_servers is not None
+    smb_nas = {item.get("id") for item in (nas_servers or []) if reference(item.get("cifsServer"))}
+    if any("cifsServer" not in item for item in (nas_servers or [])):
+        # Quando o NAS não traz a relação, usa SOMENTE o cifsServer já lido pelo
+        # handler SMB Service. Não inicia endpoint adicional de protocolo.
+        smb_servers = context.cached_resource("cifsServer")
+        if smb_servers is None:
+            coverage = False
+        else:
+            smb_nas.update(reference(item.get("nasServer")) for item in smb_servers)
+    if None in smb_nas:
+        coverage = False
+        smb_nas.discard(None)
+    configured = {reference(item.get("nasServer")) for item in checkers}
+    if None in configured:
+        coverage = False
+        configured.discard(None)
+    missing = sorted(smb_nas - configured) if coverage else []
     enabled = sum(item.get("isEnabled") is True for item in checkers)
     disabled = sum(item.get("isEnabled") is False for item in checkers)
     unknown = len(checkers) - enabled - disabled
-    status = "not_applicable" if not checkers else "partial" if unknown else "collected"
+    status = ("partial" if unknown or not coverage else
+              "not_applicable" if not checkers and not smb_nas else "collected")
     result.update(collection_status=status, checker_count=len(checkers), enabled_count=enabled,
-                  disabled_count=disabled, unknown_count=unknown)
+                  disabled_count=disabled, unknown_count=unknown, coverage_available=coverage,
+                  smb_nas_count=len(smb_nas) if coverage else None,
+                  unconfigured_nas_count=len(missing) if coverage else None)
+    result["disabled_servers"] = [antivirus_server_details(item, names) for item in checkers
+                                  if item.get("isEnabled") is False]
+    result["unknown_servers"] = [antivirus_server_details(item, names) for item in checkers
+                                 if not isinstance(item.get("isEnabled"), bool)]
+    result["unconfigured_servers"] = [{"nas_server_id": item, "nas_server_name": names.get(item) or item}
+                                      for item in missing]
     return result
 
 
 def collect_ransomware_pattern(context):
-    """Ransomware Pattern: alerta/sinal validado; virusChecker fornece contexto CAVA."""
+    """Ransomware Pattern: detecção validada ou estado da configuração CAVA.
+
+    Sem sinal de detecção, o evento acompanha virusChecker; suspeita de ransomware
+    permanece None. security_scope permite ao construtor avaliar a proteção sem
+    emitir mensagem de ataque detectado. Sinais/alertas validados prevalecem.
+    """
     antivirus = antivirus_configuration(context)
     row = collect_security(context, "Ransomware Pattern", "is_ransomware_suspected")
     row["source_details"]["observations"]["antivirus"] = antivirus
-    if row["collection_status"] == "unsupported":
-        reason = ("Sem evidência verificável de ransomware; virusChecker informa configuração "
-                  "do antivírus CAVA, não suspeita de ransomware.")
-        row.update(collection_reason=reason, custom_description=reason)
-    return row
+    if isinstance(row.get("is_ransomware_suspected"), bool):
+        row["source_details"]["observations"]["security_scope"] = "ransomware_detection"
+        return row
+    status = antivirus["collection_status"]
+    reason = ("configuracao de protecao antivirus cava consultada; deteccao de ransomware nao consultada"
+              if status == "collected" else "configuracao de protecao antivirus cava incompleta"
+              if status == "partial" else "sem nas smb ou configuracao antivirus cava para avaliar"
+              if status == "not_applicable" else antivirus.get("query_error", "consulta antivirus indisponivel"))
+    return context.event("Ransomware Pattern", status, reason,
+                         {"security_scope": "antivirus_configuration", "antivirus": antivirus})
 
 
 # Registro único: um nome de evento e uma função por regra de coleta.
@@ -1514,10 +1659,10 @@ def identify_system(api, device):
         raise CollectionError("Identidade do equipamento incompleta na sondagem REST.")
     system = systems[0]
     if not re.search(r"(?<!\d)(380F|480F)(?!\w)", str(system["model"]), re.IGNORECASE):
-        LOG.info("etapa=identidade equipamento=%s modelo=%s status=fora_do_escopo",
+        LOG.debug("etapa=identidade equipamento=%s modelo=%s status=fora_do_escopo",
                  device["name"], system["model"])
         return None
-    LOG.info("etapa=identidade equipamento=%s modelo=%s status=identificado", device["name"], system["model"])
+    LOG.debug("etapa=identidade equipamento=%s modelo=%s status=identificado", device["name"], system["model"])
     return system
 
 
@@ -1527,10 +1672,10 @@ def probe_communication(api, device):
     Um ping não verificaria sessão/permissão REST. A mesma consulta system
     confirma modelo e serial; não há login adicional ou consulta duplicada.
     """
-    LOG.info("etapa=sondagem equipamento=%s status=iniciado", device["name"])
+    LOG.debug("etapa=sondagem equipamento=%s status=iniciado", device["name"])
     system = identify_system(api, device)
     api.report("identity", system=system)
-    LOG.info("etapa=sondagem equipamento=%s status=%s", device["name"],
+    LOG.debug("etapa=sondagem equipamento=%s status=%s", device["name"],
              "comunicando" if system is not None else "fora_do_escopo")
     return system
 
@@ -1558,11 +1703,11 @@ def execute_handlers(context):
                 context.device["name"], event, handler.__name__, error_text(error), error_location(error))) from error
         context.results[event] = row
         context.api.report("row", row=row)
-        LOG.info("etapa=handler equipamento=%s handler=%r funcao=%s qualidade=%s duracao_ms=%.1f",
+        LOG.debug("etapa=handler equipamento=%s handler=%r funcao=%s qualidade=%s duracao_ms=%.1f",
                  context.device["name"], event, handler.__name__, row.get("collection_status"),
                  (time.monotonic() - started) * 1000)
         if row.get("collection_status") != "collected":
-            LOG.info("etapa=qualidade equipamento=%s handler=%r motivo=%s",
+            LOG.debug("etapa=qualidade equipamento=%s handler=%r motivo=%s",
                       context.device["name"], event, row.get("collection_reason"))
     return list(context.results.values())
 
@@ -2013,7 +2158,7 @@ def collect_unit(manager, credentials, device, config, signals, now, sleep, verb
         if progress is not None:
             progress(message)
     try:
-        LOG.info("etapa=sessao equipamento=%s status=iniciado", device["name"])
+        LOG.debug("etapa=sessao equipamento=%s status=iniciado", device["name"])
         storage = manager.UnityXT(device["ip"], credentials["unity"])
         rows = (collect_catalog_device(device, storage, verbosity, report) if catalog_only else
                 collect_device(device, storage, config, signals, now, sleep, verbosity, report))
@@ -2181,7 +2326,7 @@ def iter_device_results(manager, credentials, devices, config, signals, now, sle
                                          signals, now, sleep, verbosity, catalog_only, tuple(active))
                 active[task.receiver] = task
                 next_index += 1
-                LOG.info("etapa=supervisao equipamento=%s status=iniciado workers_ativos=%d",
+                LOG.debug("etapa=supervisao equipamento=%s status=iniciado workers_ativos=%d",
                          device["name"], len(active))
             remaining = min(task.progress.deadline()[0] for task in active.values()) - time.monotonic()
             readable = set(wait_connections(list(active), timeout=max(0, min(remaining, 0.2))))
@@ -2198,7 +2343,7 @@ def iter_device_results(manager, credentials, devices, config, signals, now, sle
                                 task.device["name"], reason)
                     result = (unavailable_catalog(task.device, state.system, reason) if catalog_only else
                               unavailable_device_rows(task.device, state.system, state.completed, config, now, reason))
-                LOG.info("etapa=supervisao equipamento=%s status=finalizado duracao_segundos=%.3f",
+                LOG.debug("etapa=supervisao equipamento=%s status=finalizado duracao_segundos=%.3f",
                          task.device["name"], time.monotonic() - task.progress.started)
                 yield task.index, task.device, result
     finally:
@@ -2275,9 +2420,12 @@ def collect_inventory(manager, credentials, devices, config, signals, now, sleep
             ordered[index] = (write_device_rows(staging_directory, index, unit_rows)
                               if staging_directory is not None else unit_rows)
             interrupted = any(row["source_details"].get("communication") for row in unit_rows)
-            LOG.info("etapa=equipamento equipamento=%s status=%s eventos=%d",
-                     device["name"], "comunicacao_interrompida" if interrupted else "concluido" if unit_rows else "fora_do_escopo",
-                     len(unit_rows))
+            failures = [row["event_name"] for row in unit_rows
+                        if row.get("collection_status") in ("unavailable", "partial")]
+            log = LOG.warning if interrupted or failures else LOG.info
+            log("etapa=equipamento equipamento=%s status=%s eventos=%d qualidade=%s eventos_com_falha=%r",
+                device["name"], "comunicacao_interrompida" if interrupted else "concluido" if unit_rows else "fora_do_escopo",
+                len(unit_rows), quality_summary(unit_rows), failures)
     if staging_directory is not None:
         return merge_device_rows(ordered)
     return [row for unit_rows in ordered for row in unit_rows]
@@ -2439,9 +2587,10 @@ def run_collection(output, manager=None, config=None, signals=None, now=None, sl
         publish_snapshot(temporary, output)
     failed = sum(any(event["source_details"].get("communication") for event in unit["events"].values())
                  for unit in snapshot)
-    LOG.info("etapa=ciclo status=%s arquivo=%s equipamentos=%d equipamentos_com_falha=%d registros=%d duracao_segundos=%.3f",
+    LOG.info("etapa=ciclo status=%s arquivo=%s equipamentos=%d equipamentos_com_falha=%d registros=%d "
+             "duracao_segundos=%.3f qualidade=%s",
              "concluido_com_falhas" if failed else "concluido", output, len(snapshot), failed, len(rows),
-             time.monotonic() - started)
+             time.monotonic() - started, quality_summary(rows))
     return snapshot
 
 
@@ -2503,8 +2652,7 @@ def main(argv=None):
         parser.error("-vv exige --host para mostrar respostas de apenas uma unidade.")
     if args.host and not args.verbose and not args.catalog_only:
         parser.error("Use --host com -v/-vv ou --catalog-only para diagnóstico.")
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging(args.verbose)
     LOG.info("etapa=versao versao=%s suporte=paralelo workers_padrao=%d max_workers=%d",
              COLLECTOR_VERSION, DEFAULT_WORKERS, MAX_WORKERS)
     try:
