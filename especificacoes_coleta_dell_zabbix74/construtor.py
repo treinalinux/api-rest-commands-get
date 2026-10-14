@@ -1,8 +1,9 @@
-"""Constrói um JSON com todos os ACTIVE_HANDLERS por equipamento.
+"""Constrói o JSON mínimo de monitoração executando todos os ACTIVE_HANDLERS.
 
 Entrada: objeto, lista de objetos ou {"events": [...]} com os campos do CSV
-anterior e listas opcionais de discos/fans afetados. Usa apenas a biblioteca
-padrão e é compatível com Python 3.6+.
+anterior, ou input v2 do coletor. Publica device_info e os arrays availability,
+performance e protection, com macros LLD. Conserva a avaliação completa em
+private/done-<nome>-full.json. Biblioteca padrão, sem interação, Python 3.6+.
 """
 
 import argparse
@@ -13,10 +14,11 @@ import re
 import stat
 import sys
 import tempfile
+import unicodedata
 
 
 BASE_PATH = "."
-CONSTRUCTOR_VERSION = "2026.10.14-seguranca-logs"
+CONSTRUCTOR_VERSION = "2026.10.14-lld-minimo"
 
 # ==========================================
 # CONTRATOS E LIMITES DE HARDWARE E SERVIÇOS
@@ -553,7 +555,8 @@ def handle_controller_cpu(row):
     return event
 
 
-def handle_volume_usage(row):
+def _evaluate_volume_usage(row):
+    """Regra de volume compartilhada pela avaliação agregada e por recurso."""
     event = _build_base_event(row)
     details = event["event_details"]
 
@@ -580,7 +583,13 @@ def handle_volume_usage(row):
     return event
 
 
-def handle_pool_usage(row):
+def handle_volume_usage(row):
+    """Handler obrigatório Volume Usage; usa a regra comum de ocupação."""
+    return _evaluate_volume_usage(row)
+
+
+def _evaluate_pool_usage(row):
+    """Regra de pool compartilhada pela avaliação agregada e por recurso."""
     event = _build_base_event(row)
     details = event["event_details"]
 
@@ -607,7 +616,13 @@ def handle_pool_usage(row):
     return event
 
 
-def handle_pool_full(row):
+def handle_pool_usage(row):
+    """Handler obrigatório Pool Usage; usa a regra comum de ocupação."""
+    return _evaluate_pool_usage(row)
+
+
+def _evaluate_pool_full(row):
+    """Regra crítica de pool compartilhada pela avaliação agregada e por recurso."""
     event = _build_base_event(row)
     details = event["event_details"]
 
@@ -632,6 +647,11 @@ def handle_pool_full(row):
     }
 
     return event
+
+
+def handle_pool_full(row):
+    """Handler obrigatório Pool Full; usa a regra comum de ocupação."""
+    return _evaluate_pool_full(row)
 
 
 def handle_replication_failed(row):
@@ -950,6 +970,43 @@ ACTIVE_HANDLERS = {
     "Unauthorized Admin": handle_unauthorized_admin,
     "Certificate Expiring": handle_certificate_expiring,
     "Ransomware Pattern": handle_ransomware_pattern
+}
+
+# Classificação da saída pública. Todos os 25 handlers precisam estar aqui.
+MONITORING_GROUPS = {
+    "availability": (
+        "Cluster Down", "Controller Down", "Multiple Disk Failure",
+        "Power Supply Failure", "Fan Failure", "High Temp",
+    ),
+    "performance": (
+        "SMB latency", "NFS latency", "NFS retransmissions", "CPU utilization",
+        "Storage utilization", "Network utilization", "Packet loss", "Controller CPU",
+        "Volume Usage", "Pool Usage", "Pool Full",
+    ),
+    "protection": (
+        "Replication Failed", "Replication Lag", "NFS Service", "SMB Service",
+        "Audit Disabled", "Unauthorized Admin", "Certificate Expiring", "Ransomware Pattern",
+    ),
+}
+PRIMARY_METRIC_FIELDS = {
+    "high_temp": "current_temperature_celsius",
+    "smb_latency": "smb_latency_ms", "nfs_latency": "nfs_latency_ms",
+    "nfs_retransmissions": "nfs_retransmissions_pct", "cpu_utilization": "cpu_utilization_pct",
+    "storage_utilization": "storage_utilization_pct", "network_utilization": "network_utilization_pct",
+    "packet_loss": "packet_loss_pct", "controller_cpu": "controller_cpu_percentage",
+    "volume_usage": "usage_percentage", "pool_usage": "usage_percentage", "pool_full": "usage_percentage",
+    "replication_lag": "lag_minutes", "nfs_service": "is_configured", "smb_service": "is_configured",
+    "audit_disabled": "is_audit_disabled", "unauthorized_admin": "has_unauthorized_admin",
+    "certificate_expiring": "days_to_expire",
+}
+HARDWARE_COUNTS = {
+    "controller_down": ("total_controllers", "failed_controllers"),
+    "multiple_disk_failure": ("total_disks", "failed_disks"),
+    "power_supply_failure": ("total_psus", "failed_psus"),
+    "fan_failure": ("total_fans", "failed_fans"),
+}
+CAPACITY_EVALUATORS = {
+    "volume_usage": _evaluate_volume_usage, "pool_usage": _evaluate_pool_usage, "pool_full": _evaluate_pool_full,
 }
 
 
@@ -1459,33 +1516,210 @@ def build_device_payload(group):
     return {"device_info": _build_device_info(context), "events": events}
 
 
+def monitoring_text(value):
+    """Normaliza mensagens/identificadores para minúsculas sem acentos.
+
+    Preserva pontuação e separadores de ID; espaços e quebras de linha viram
+    espaços simples. Não altera identidade do equipamento nem o JSON completo.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(value))
+    return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).casefold().split())
+
+
+def numeric_metric(value):
+    """Aceita números finitos, converte booleanos em 0/1 e preserva null."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int) or isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def monitoring_status(event):
+    """Distingue fonte sem suporte de consulta indisponível, sem confirmar OK."""
+    quality = event["event_details"].get("collection", {}).get("status")
+    if quality == "unsupported":
+        return "unsupported"
+    if quality == "unavailable":
+        return "UNKNOWN"
+    if quality == "not_applicable":
+        return "NOT_APPLICABLE"
+    status = event.get("component_health_status", "UNKNOWN")
+    known = {"OK", "WARNING", "CRITICAL", "OPERATIONAL", "UNKNOWN", "NOT_APPLICABLE"}
+    return status if status in known else "UNKNOWN"
+
+
+def primary_metric(component, event):
+    """Seleciona uma medição com significado fixo para cada handler.
+
+    Hardware: quantidade saudável. Replication Failed: sessões com falha.
+    Ransomware Pattern: NAS com CAVA desabilitado/sem configuração, mesmo quando
+    um sinal real de ransomware determina o status. Demais: mapa explícito.
+    Coleta parcial/indisponível/sem suporte não produz medição histórica.
+    """
+    details = event["event_details"]
+    quality = details.get("collection", {}).get("status")
+    if quality in ("partial", "unavailable", "unsupported") or monitoring_status(event) == "UNKNOWN":
+        return None
+    metrics = details.get("metrics", {})
+    observations = _security_observations(details)
+    if component in HARDWARE_COUNTS:
+        total_key, failed_key = HARDWARE_COUNTS[component]
+        total, failed = metrics.get(total_key), metrics.get(failed_key)
+        if (isinstance(total, int) and not isinstance(total, bool)
+                and isinstance(failed, int) and not isinstance(failed, bool) and 0 <= failed <= total):
+            return total - failed
+        return None
+    if component == "replication_failed":
+        failed = observations.get("failed_session_ids")
+        if isinstance(failed, list):
+            return len(failed)
+        return 0 if metrics.get("is_configured") is False else None
+    if component == "ransomware_pattern":
+        antivirus = observations.get("antivirus")
+        if isinstance(antivirus, dict):
+            disabled, missing = antivirus.get("disabled_count"), antivirus.get("unconfigured_nas_count")
+            if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                   for value in (disabled, missing)):
+                return disabled + missing
+        return None
+    return numeric_metric(metrics.get(PRIMARY_METRIC_FIELDS.get(component)))
+
+
+def monitoring_record(component, event):
+    """Cria somente as três macros de texto e a métrica primária quando aplicável."""
+    record = {
+        "{#COMPONENTE}": component,
+        "{#STATUS}": monitoring_status(event),
+        "{#DESCRICAO}": monitoring_text(event["event_details"].get("custom_description") or "medicao indisponivel"),
+    }
+    if component != "cluster_down":
+        record["{#METRICA}"] = primary_metric(component, event)
+    return record
+
+
+def capacity_records(event_name, event, context):
+    """Expande volumes/pools por ID, reaplicando as mesmas regras de capacidade.
+
+    Não consulta o equipamento. Usa os percentuais e IDs já coletados em
+    source_details.observations.resources. Nome amigável nunca identifica o item.
+    Sem inventário detalhado, mantém a linha agregada do handler. Registros sem
+    ID geram uma linha agregada UNKNOWN, sem IDs artificiais ou perda silenciosa.
+    """
+    component = event_name.lower().replace(" ", "_")
+    details = event["event_details"]
+    observations = _security_observations(details)
+    resources = observations.get("resources")
+    if not isinstance(resources, list) or not resources:
+        return [monitoring_record(component, event)]
+    records, unidentified = [], 0
+    for resource in resources:
+        if not isinstance(resource, dict) or not isinstance(resource.get("id"), (str, int)) \
+                or isinstance(resource.get("id"), bool) or not str(resource["id"]).strip():
+            unidentified += 1
+            continue
+        resource_id = monitoring_text(resource["id"])
+        kind = monitoring_text(observations.get("resource") or "volume")
+        identifier = (f"{component}:{kind}:{resource_id}" if component == "volume_usage"
+                      else f"{component}:{resource_id}")
+        value = numeric_metric(resource.get("usage_percentage"))
+        if isinstance(resource.get("usage_percentage"), bool) or value is None or not 0 <= value <= 100:
+            records.append({"{#COMPONENTE}": identifier, "{#STATUS}": "UNKNOWN",
+                            "{#DESCRICAO}": f"medicao de ocupacao invalida ou ausente para {identifier}",
+                            "{#METRICA}": None})
+            continue
+        row = dict(context, event_name=event_name, health_status="OK", usage_percentage=value)
+        scoped = _finalize_event(CAPACITY_EVALUATORS[component](row), event_name)
+        quality = details.get("collection")
+        if isinstance(quality, dict):
+            source = {"collection_status": quality["status"], "collection_reason": quality.get("reason", ""),
+                      "source_details": details.get("source_details", {}), "usage_percentage": value}
+            scoped = _attach_collection_quality(scoped, source, event_name)
+        record = monitoring_record(component, scoped)
+        record["{#COMPONENTE}"] = identifier
+        label = monitoring_text(resource.get("name") or resource["id"])
+        record["{#DESCRICAO}"] = f"{label} (id {resource_id}): " + record["{#DESCRICAO}"]
+        records.append(record)
+    if unidentified:
+        records.append({"{#COMPONENTE}": component, "{#STATUS}": "UNKNOWN",
+                        "{#DESCRICAO}": f"inventario incompleto: {unidentified} recurso(s) sem identificador estavel",
+                        "{#METRICA}": None})
+    return records
+
+
+def build_monitoring_payload(group, full_payload=None):
+    """Converte a avaliação completa para o contrato público de três arrays.
+
+    build_device_payload() executa todos os 25 ACTIVE_HANDLERS uma vez; esta
+    apresentação preserva suas regras e avalia cada volume/pool individualmente.
+    O JSON completo pode ser fornecido para evitar repetir a avaliação principal.
+    """
+    registered = [event for events in MONITORING_GROUPS.values() for event in events]
+    if len(registered) != len(set(registered)) or set(registered) != set(ACTIVE_HANDLERS):
+        raise InputValidationError("Classifique todos os ACTIVE_HANDLERS uma única vez em MONITORING_GROUPS.")
+    full_payload = build_device_payload(group) if full_payload is None else full_payload
+    info = dict(full_payload["device_info"])
+    if info["family"].casefold() == "unity":
+        info["family"] = "Unity"
+    info["type"] = "Storage"
+    payload = {"device_info": info}
+    seen = set()
+    for category, event_names in MONITORING_GROUPS.items():
+        records = []
+        for event_name in event_names:
+            component = event_name.lower().replace(" ", "_")
+            event = full_payload["events"][component]
+            values = (capacity_records(event_name, event, group["context"]) if component in CAPACITY_EVALUATORS
+                      else [monitoring_record(component, event)])
+            for record in values:
+                identifier = record["{#COMPONENTE}"]
+                if identifier in seen:
+                    raise InputValidationError(f"Identificador público repetido: {identifier}.")
+                seen.add(identifier)
+                records.append(record)
+        payload[category] = records
+    return payload
+
+
 def process_json_events(json_filepath, verbose=False, base_path=None):
-    """Valida toda a entrada, chama todos os handlers e retorna as saídas geradas.
+    """Publica o contrato mínimo e conserva a avaliação completa por equipamento.
 
     Erros de entrada levantam InputValidationError antes de substituir arquivos.
     Registros devem estar em ordem de coleta; para um evento repetido, vence o último.
+    Retorna somente caminhos públicos. Todos os temporários são preparados antes
+    de substituir arquivos; atomicidade é por arquivo, não uma transação global.
+    O arquivo completo fica em private, modo 0600, e é substituído a cada ciclo.
     """
     groups = group_device_rows(load_json_rows(json_filepath))
     output_root = os.path.abspath(BASE_PATH if base_path is None else base_path)
-    outputs = []
+    outputs, full_outputs = [], []
     for (family, name), group in groups.items():
-        payload = build_device_payload(group)
+        full_payload = build_device_payload(group)
+        payload = build_monitoring_payload(group, full_payload)
         # Valida a serialização de todas as saídas antes de iniciar a gravação.
         json.dumps(payload, ensure_ascii=False, allow_nan=False)
         final_path = os.path.join(output_root, family, name, "public", f"done-{name}.json")
         if os.path.realpath(final_path) == os.path.realpath(json_filepath):
             raise InputValidationError("O arquivo de entrada não pode ser o arquivo de saída.")
         outputs.append((final_path, payload))
+        full_path = os.path.join(output_root, family, name, "private", f"done-{name}-full.json")
+        if os.path.realpath(full_path) == os.path.realpath(json_filepath):
+            raise InputValidationError("O arquivo de entrada não pode ser o arquivo completo de saída.")
+        json.dumps(full_payload, ensure_ascii=False, allow_nan=False)
+        full_outputs.append((full_path, full_payload))
 
     staged = []
+    planned = [(path, data, True) for path, data in full_outputs]
+    planned.extend((path, data, False) for path, data in outputs)
     try:
-        for final_path, payload in outputs:
+        for final_path, payload, private in planned:
             target_dir = os.path.dirname(final_path)
-            os.makedirs(target_dir, exist_ok=True)
+            os.makedirs(target_dir, mode=0o700 if private else 0o755, exist_ok=True)
             descriptor, temp_path = tempfile.mkstemp(prefix=".events-", suffix=".json.tmp", dir=target_dir)
             os.close(descriptor)
             staged.append((temp_path, final_path))
-            output_mode = stat.S_IMODE(os.stat(final_path).st_mode) if os.path.exists(final_path) else 0o644
+            output_mode = (0o600 if private else
+                           stat.S_IMODE(os.stat(final_path).st_mode) if os.path.exists(final_path) else 0o644)
             os.chmod(temp_path, output_mode)
             write_temp_json(temp_path, payload)
         for temp_path, final_path in staged:
@@ -1505,7 +1739,7 @@ def main(argv=None):
                         help="Mostra a versão sem processar arquivos.")
     parser.add_argument("--input", default="input_events.json", help="Arquivo JSON de entrada (padrão: input_events.json).")
     parser.add_argument("--output-dir", default=BASE_PATH, help="Diretório base das saídas (padrão: diretório atual).")
-    parser.add_argument("--verbose", action="store_true", help="Exibe os caminhos e os JSONs gerados.")
+    parser.add_argument("--verbose", action="store_true", help="Exibe caminhos e JSONs mínimos/completos gerados.")
     args = parser.parse_args(argv)
     try:
         process_json_events(args.input, verbose=args.verbose, base_path=args.output_dir)
