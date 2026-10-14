@@ -42,7 +42,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlencode, urljoin, urlsplit
 
 
 LOG = logging.getLogger("unity.collector")
-COLLECTOR_VERSION = "2026.10.13-compat-fields"
+COLLECTOR_VERSION = "2026.10.13-metricas-limitadas"
 INPUT_FIELDS = (
     "family", "type", "name", "serial_number", "service_tag", "software_version",
     "health_status", "uptime_seconds", "datetime", "manufacturer_division",
@@ -101,6 +101,8 @@ NETWORK_TRAFFIC_PATHS = {
 CONFIRMED_HISTORICAL_PATHS = frozenset(
     tuple(PREFERRED_LATENCY_PATHS.values()) + tuple(NETWORK_TRAFFIC_PATHS.values()))
 HISTORICAL_INTERVAL_SECONDS = 300
+METRIC_GAUGE_PAGE_SIZE = 2
+METRIC_PAGE_SIZE = 64
 CPU_BUSY = "sp.*.cpu.summary.busyTicks"
 CPU_IDLE = "sp.*.cpu.summary.idleTicks"
 PERFORMANCE = {
@@ -428,6 +430,53 @@ class UnityAPI:
                                    next_links[0].get("href"), resource_path)
         raise CollectionError("Limite de páginas excedido em {}.".format(resource))
 
+    def metric_page(self, resource, filter_expression, paths, limit=METRIC_PAGE_SIZE):
+        """Le uma unica pagina de amostras, sem seguir links next.
+
+        Pede ordenacao decrescente de timestamp, per_page e page=1. Se o
+        firmware rejeitar esses parametros com HTTP 400/422, tenta somente
+        uma vez com o filtro original, ainda sem percorrer paginas.
+        Retem os registros mais novos dos caminhos esperados na pagina recebida.
+        Nao altera collection(), que precisa do inventario completo de hardware.
+        """
+        if resource not in ("metricValue", "metricQueryResult"):
+            raise CollectionError("metric_page aceita somente recursos de amostras.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= METRIC_PAGE_SIZE:
+            raise CollectionError("Limite de amostras inválido em metric_page.")
+        resource_path = "/api/types/{}/instances".format(resource)
+        parameters = {"filter": filter_expression, "orderby": "timestamp desc",
+                      "per_page": limit, "page": 1}
+        try:
+            payload = self.request("GET", resource_path + "?" + urlencode(parameters))
+        except RESTError as error:
+            if error.status not in (400, 422):
+                raise
+            LOG.info("etapa=compatibilidade_metricas equipamento=%s recurso=%s http_status=%d "
+                     "tentativa=apenas_filtro paginas_seguidas=0",
+                     self.device_name, resource, error.status)
+            payload = self.request("GET", resource_path + "?" + urlencode({"filter": filter_expression}))
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise CollectionError("Coleção {} sem entries válidas.".format(resource))
+        expected = set(paths)
+        selected = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("content"), dict):
+                raise CollectionError("Item inválido em {}.".format(resource))
+            item = entry["content"]
+            if item.get("path") not in expected:
+                continue
+            try:
+                moment = timestamp(item.get("timestamp"))
+            except ValueError:
+                continue
+            selected.append((moment, item))
+        selected.sort(key=lambda sample: sample[0], reverse=True)
+        LOG.debug("etapa=amostras equipamento=%s recurso=%s recebidas=%d retidas=%d "
+                  "paginas_seguidas=0 limite=%d",
+                  self.device_name, resource, len(entries), min(len(selected), limit), limit)
+        return [item for moment, item in selected[:limit]]
+
 
 def flatten_values(value, prefix=""):
     """Achata valores de métricas por caminho de instância, mantendo só números."""
@@ -563,11 +612,12 @@ def read_confirmed_historical_metric(api, path):
     path/timestamp/interval/values fazem parte do payload de metricValue;
     nao precisam ser pedidos como atributos de uma colecao de hardware.
     Um caminho por consulta impede uma rejeicao de invalidar os demais.
-    A selecao de amostras recentes permanece no consumidor, em metric_samples.
+    metric_page busca uma unica pagina e retem ate duas amostras; a idade e
+    validada pelo consumidor em metric_samples. Nunca varre o historico.
     """
     expression = '(path EQ "{}") AND interval EQ "{}"'.format(
         path.replace('"', '\\"'), HISTORICAL_INTERVAL_SECONDS)
-    return api.collection("metricValue", filter_expression=expression, compact=False)
+    return api.metric_page("metricValue", expression, (path,), limit=METRIC_GAUGE_PAGE_SIZE)
 
 
 def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=time.sleep):
@@ -606,9 +656,7 @@ def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=tim
             # Três intervalos dão margem para duas amostras de contadores.
             for _ in range(3):
                 sleep(interval)
-                collected.extend(api.collection("metricQueryResult",
-                                                filter_expression="queryId eq {}".format(query_id),
-                                                compact=False))
+                collected.extend(api.metric_page("metricQueryResult", "queryId eq {}".format(query_id), realtime))
         except Exception as error:
             reasons.append("Métricas em tempo real: " + error_text(error))
             LOG.warning("etapa=metricas equipamento=%s modo=realtime erro=%s local=%s",
@@ -637,7 +685,7 @@ def read_metrics(api, catalog, bindings, now, mode, interval, max_age, sleep=tim
             path_filter = " or ".join('path eq "{}"'.format(path.replace('"', '\\"')) for path in other)
             expression = '({}) and timestamp gt "{}"'.format(path_filter, iso(now - timedelta(seconds=max_age)))
             try:
-                collected.extend(api.collection("metricValue", filter_expression=expression, compact=False))
+                collected.extend(api.metric_page("metricValue", expression, other))
             except Exception as error:
                 reasons.append("Métricas históricas: " + error_text(error))
                 LOG.warning("etapa=metricas equipamento=%s modo=historical paths=%s erro=%s local=%s",
